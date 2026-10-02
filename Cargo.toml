@@ -17,6 +17,7 @@ wal-db = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 metrics = "0.24"
+reqwest = { version = "0.12", features = ["json"] }
 
 [dev-dependencies]
 reqwest = { version = "0.12", features = ["json"] }
