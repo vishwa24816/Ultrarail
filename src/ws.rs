@@ -62,7 +62,10 @@ pub async fn submit(
     let tx_id = partition::tx_id(bucket, &debit, &credit);
     let (tx_reply, rx) = oneshot::channel();
     let cmd = WriteCmd { scope, key, money, debit_account: debit, credit_account: credit, bucket, tx_id, reply: tx_reply };
-    state.writers[p].send(cmd).await.map_err(|_| "writer overloaded".to_string())?;
+    if state.draining.load(std::sync::atomic::Ordering::Relaxed) {
+        return Err("draining for shutdown".to_string());
+    }
+    state.writers[p].send(cmd).await?;
     let (id, lsn, replayed) = rx.await.map_err(|_| "writer gone".to_string())??;
     metrics::observe_total(t0.elapsed().as_secs_f64() * 1000.0);
     Ok((id, lsn, replayed, p))

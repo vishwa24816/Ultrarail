@@ -18,8 +18,8 @@ async fn spawn_app() -> (String, tempfile::TempDir, tokio::process::Child) {
     let mut child = cmd.spawn().expect("spawn server");
     let base = format!("http://127.0.0.1:{port}");
     let client = reqwest::Client::new();
-    for _ in 0..100 {
-        if client.get(format!("{base}/health")).send().await.map(|r| r.status().is_success()).unwrap_or(false) {
+    for _ in 0..200 {
+        if client.get(format!("{base}/ready")).send().await.map(|r| r.status().is_success()).unwrap_or(false) {
             break;
         }
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;

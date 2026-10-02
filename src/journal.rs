@@ -333,6 +333,12 @@ impl Journal {
         self.tx_index.len()
     }
 
+    /// Final durability barrier (shutdown path).
+    pub fn sync(&mut self) -> Result<(), JournalError> {
+        self.wal.sync()?;
+        Ok(())
+    }
+
     /// All durable tx ids (for delivery re-queue on boot).
     pub fn tx_list(&self) -> Vec<(String, u64)> {
         self.tx_index.iter().map(|(k, v)| (k.clone(), *v)).collect()

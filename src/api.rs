@@ -29,16 +29,37 @@ struct Rejected {
 
 pub fn router(state: AppState) -> Router {
     use tower_http::limit::RequestBodyLimitLayer;
-    Router::new()
+    let mut r = Router::new()
         .route("/health", get(|| async { "ok" }))
+        .route("/ready", get(read_ready))
         .route("/payments", axum::routing::post(create_payment))
         .route("/dlq", get(read_dlq))
         .route("/payments/:id", get(read_payment))
         .route("/ws/client", get(crate::ws::ws_client))
-        .route("/ws/bank", get(crate::ws::ws_bank))
-        .layer(RequestBodyLimitLayer::new(64 * 1024))
-        .layer(tower_http::trace::TraceLayer::new_for_http())
+        .route("/ws/bank", get(crate::ws::ws_bank));
+    // Sandbox-only shutdown hook: same code path as SIGTERM. Never enable in prod.
+    if std::env::var("PAYMENT_TEST_HOOKS").as_deref() == Ok("true") {
+        r = r.route("/test/shutdown", axum::routing::post(test_shutdown));
+    }
+    r.layer(RequestBodyLimitLayer::new(64 * 1024))
+        // 503s from /ready polling are routine, not errors — keep logs clean.
+        .layer(tower_http::trace::TraceLayer::new_for_http().on_failure(()))
         .with_state(state)
+}
+
+async fn test_shutdown(State(state): State<AppState>) -> impl IntoResponse {
+    state.draining.store(true, std::sync::atomic::Ordering::Relaxed);
+    let _ = state.shutdown_tx.send(true);
+    (StatusCode::ACCEPTED, Json(serde_json::json!({"draining": true}))).into_response()
+}
+
+async fn read_ready(State(state): State<AppState>) -> impl IntoResponse {
+    let ok = state.ready.lock().map(|r| !r.is_empty() && r.iter().all(|b| *b)).unwrap_or(false);
+    if ok {
+        (StatusCode::OK, Json(serde_json::json!({"ready": true}))).into_response()
+    } else {
+        (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({"ready": false}))).into_response()
+    }
 }
 
 async fn read_payment(
@@ -129,8 +150,16 @@ async fn create_payment(
         tx_id,
         reply: tx_reply,
     };
-    if state.writers[p].send(cmd).await.is_err() {
-        return (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({"status":"REJECTED","reason":"writer overloaded"})))
+    if state.draining.load(std::sync::atomic::Ordering::Relaxed) {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            [(axum::http::header::RETRY_AFTER, "5")],
+            Json(serde_json::json!({"status":"REJECTED","reason":"draining for shutdown"})),
+        )
+            .into_response();
+    }
+    if let Err(reason) = state.writers[p].send(cmd).await {
+        return (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({"status":"REJECTED","reason":reason})))
             .into_response();
     }
     match rx.await {

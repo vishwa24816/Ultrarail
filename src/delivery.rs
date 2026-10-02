@@ -115,6 +115,9 @@ pub struct Delivery {
     pub rail_timeout: Duration,
     pub reconcile_timeout_ms: u64,
     pub partition: usize,
+    /// Attempt counts rebuilt from the event log on restart (budget survives crashes).
+    pub boot_attempts: HashMap<String, u32>,
+    pub shutdown: tokio::sync::watch::Receiver<bool>,
 }
 
 fn backoff(attempt: u32) -> Duration {
@@ -129,16 +132,27 @@ impl Delivery {
         let mut pending: HashMap<String, Work> = HashMap::new();
         let mut queue: VecDeque<String> = VecDeque::new();
         let mut reconcile_tick = tokio::time::interval(Duration::from_secs(5));
+        let mut closed = false;
         loop {
+            if closed && queue.is_empty() {
+                self.sync_events();
+                break;
+            }
             tokio::select! {
-                Some(tx) = self.inbox.recv() => {
-                    let id = tx.tx_id.clone();
-                    if !pending.contains_key(&id) {
-                        pending.insert(id.clone(), Work {
-                            tx, state: DState::Queued, attempts: 0,
-                            next_retry: Instant::now(), inflight: false,
-                        });
-                        queue.push_back(id);
+                msg = self.inbox.recv(), if !closed => {
+                    match msg {
+                        Some(tx) => {
+                            let id = tx.tx_id.clone();
+                            if !pending.contains_key(&id) {
+                                let attempts = self.boot_attempts.remove(&id).unwrap_or(0);
+                                pending.insert(id.clone(), Work {
+                                    tx, state: DState::Queued, attempts,
+                                    next_retry: Instant::now(), inflight: false,
+                                });
+                                queue.push_back(id);
+                            }
+                        }
+                        None => { closed = true; }
                     }
                 }
                 Ok((id, term)) = self.failed_rx.recv() => {
@@ -157,6 +171,10 @@ impl Delivery {
                 _ = tokio::time::sleep(Duration::from_millis(50)) => {
                     self.pump(&mut pending, &mut queue).await;
                     self.sync_events();
+                }
+                _ = self.shutdown.changed() => {
+                    // Drain: finish everything queued, sync, exit. Main enforces the deadline.
+                    closed = true;
                 }
             }
         }

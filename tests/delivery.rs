@@ -15,7 +15,7 @@ async fn spawn_with(dir: &std::path::Path, extra: &[(&str, &str)]) -> (String, t
     let base = format!("http://127.0.0.1:{port}");
     let client = reqwest::Client::new();
     for _ in 0..200 {
-        if client.get(format!("{base}/health")).send().await.map(|r| r.status().is_success()).unwrap_or(false) {
+        if client.get(format!("{base}/ready")).send().await.map(|r| r.status().is_success()).unwrap_or(false) {
             return (base, child);
         }
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
