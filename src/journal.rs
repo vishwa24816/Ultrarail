@@ -41,6 +41,17 @@ pub struct AcceptOutcome {
     pub durable: bool,
 }
 
+/// A validated tx waiting for its batch's sync.
+pub enum Staged {
+    Replay(PaymentTx),
+    Fresh(PaymentTx, Vec<u8>),
+}
+
+enum StagedKind {
+    Replay(PaymentTx),
+    Fresh(usize), // index into pending
+}
+
 impl Journal {
     pub fn open(path: &Path) -> Result<Self, JournalError> {
         let wal = Wal::open(path)?;
@@ -58,21 +69,22 @@ impl Journal {
         self.tx_index.get(tx_id).copied()
     }
 
-    /// Build + validate + append + sync. Returns durable outcome — the ONLY ack path.
-    pub fn accept(
+    /// Build + validate + serialize. No I/O — safe to call outside the writer.
+    /// Returns the existing tx on idempotency hit (no new record).
+    pub fn prepare(
         &mut self,
         scope: String,
         key: String,
         money: Money,
         debit_account: String,
         credit_account: String,
-    ) -> Result<(PaymentTx, AcceptOutcome), JournalError> {
-        if let Some(tx_id) = self.lookup(&scope, &key) {
-            let lsn = self.tx_index[tx_id];
-            let tx = self.read_tx(lsn)?;
-            return Ok((tx, AcceptOutcome { lsn, durable: true }));
+        bucket: u64,
+        tx_id: String,
+    ) -> Result<Staged, JournalError> {
+        if let Some(existing) = self.lookup(&scope, &key) {
+            let tx = self.read_tx(existing)?;
+            return Ok(Staged::Replay(tx));
         }
-        let tx_id = uuid::Uuid::now_v7().to_string();
         let entries = vec![
             LedgerEntry { account: debit_account, debit: money.amount, credit: 0 },
             LedgerEntry { account: credit_account, debit: 0, credit: money.amount },
@@ -92,29 +104,122 @@ impl Journal {
         tx.status = TxStatus::Validated;
         tx.request_hash = checksum(tx.tx_id.as_bytes()) as u64;
         let mut bytes = serde_json::to_vec(&tx).map_err(|e| JournalError::Codec(e.to_string()))?;
-        let sum = checksum(&bytes);
-        tx.checksum = sum;
+        tx.checksum = checksum(&bytes);
         bytes = serde_json::to_vec(&tx).map_err(|e| JournalError::Codec(e.to_string()))?;
-        let lsn: u64 = self.wal.append(&bytes)?.get();
-        self.wal.sync()?; // <-- durability barrier; ack only after this returns
-        tx.status = TxStatus::AcceptedDurable;
-        self.tx_index.insert(tx.tx_id.clone(), lsn);
-        self.idem_index.insert((tx.idempotency_scope.clone(), tx.idempotency_key.clone()), tx.tx_id.clone());
-        Ok((tx, AcceptOutcome { lsn, durable: true }))
+        let _ = bucket; // embedded in tx_id already; kept for future bucketed segments
+        Ok(Staged::Fresh(tx, bytes))
     }
 
-    fn read_tx(&self, _lsn: u64) -> Result<PaymentTx, JournalError> {
-        // ponytail: re-scan is O(n); per-tx offset cache when it matters
+    /// Append a whole batch, then ONE sync for all of them (group commit).
+    /// Ack-worthy only after this returns Ok.
+    pub fn commit_batch(&mut self, batch: Vec<Staged>) -> Vec<Result<(PaymentTx, AcceptOutcome), JournalError>> {
+        let mut seen: BTreeMap<(String, String), PaymentTx> = BTreeMap::new();
+        let mut pending: Vec<(PaymentTx, Vec<u8>)> = Vec::new();
+        // First pass: dedupe within the batch, append-serialize the rest.
+        let mut kinds: Vec<StagedKind> = Vec::with_capacity(batch.len());
+        for s in batch {
+            match s {
+                Staged::Replay(tx) => kinds.push(StagedKind::Replay(tx)),
+                Staged::Fresh(tx, bytes) => {
+                    let k = (tx.idempotency_scope.clone(), tx.idempotency_key.clone());
+                    if let Some(first) = seen.get(&k) {
+                        kinds.push(StagedKind::Replay(first.clone()));
+                    } else {
+                        seen.insert(k, tx.clone());
+                        pending.push((tx, bytes));
+                        kinds.push(StagedKind::Fresh(pending.len() - 1));
+                    }
+                }
+            }
+        }
+        if pending.is_empty() {
+            return kinds
+                .into_iter()
+                .map(|k| match k {
+                    StagedKind::Replay(tx) => Ok((tx, AcceptOutcome { lsn: 0, durable: true })),
+                    StagedKind::Fresh(_) => unreachable!(),
+                })
+                .collect();
+        }
+        let mut lsns: Vec<u64> = Vec::with_capacity(pending.len());
+        for (_, bytes) in &pending {
+            match self.wal.append(bytes) {
+                Ok(lsn) => lsns.push(lsn.get()),
+                Err(e) => {
+                    let err = e.to_string();
+                    return kinds
+                        .into_iter()
+                        .map(|k| match k {
+                            StagedKind::Replay(tx) => Ok((tx, AcceptOutcome { lsn: 0, durable: true })),
+                            StagedKind::Fresh(_) => Err(JournalError::Codec(err.clone())),
+                        })
+                        .collect();
+                }
+            }
+        }
+        if let Err(e) = self.wal.sync() {
+            // <-- single durability barrier for the whole batch
+            let err = e.to_string();
+            return kinds
+                .into_iter()
+                .map(|k| match k {
+                    StagedKind::Replay(tx) => Ok((tx, AcceptOutcome { lsn: 0, durable: true })),
+                    StagedKind::Fresh(_) => Err(JournalError::Codec(err.clone())),
+                })
+                .collect();
+        }
+        let mut it = lsns.into_iter();
+        for (tx, _) in &mut pending {
+            let lsn = it.next().unwrap_or(0);
+            tx.status = TxStatus::AcceptedDurable;
+            self.tx_index.insert(tx.tx_id.clone(), lsn);
+            self.idem_index.insert(
+                (tx.idempotency_scope.clone(), tx.idempotency_key.clone()),
+                tx.tx_id.clone(),
+            );
+        }
+        kinds
+            .into_iter()
+            .map(|k| match k {
+                StagedKind::Replay(tx) => Ok((tx, AcceptOutcome { lsn: 0, durable: true })),
+                StagedKind::Fresh(i) => {
+                    let (tx, _) = &pending[i];
+                    Ok((tx.clone(), AcceptOutcome { lsn: self.tx_index[&tx.tx_id], durable: true }))
+                }
+            })
+            .collect()
+    }
+
+    /// Legacy single-accept (prepare + solo commit). Kept for unit tests.
+    pub fn accept(
+        &mut self,
+        scope: String,
+        key: String,
+        money: Money,
+        debit_account: String,
+        credit_account: String,
+    ) -> Result<(PaymentTx, AcceptOutcome), JournalError> {
+        let bucket = 0;
+        let tx_id = uuid::Uuid::now_v7().to_string();
+        let staged = self.prepare(scope, key, money, debit_account, credit_account, bucket, tx_id)?;
+        let mut out = self.commit_batch(vec![staged]);
+        out.pop().unwrap()
+    }
+
+    fn read_tx(&self, want: &str) -> Result<PaymentTx, JournalError> {
         for entry in self.wal.iter()? {
             let entry = entry?;
             let tx: PaymentTx =
                 serde_json::from_slice(entry.data()).map_err(|e| JournalError::Codec(e.to_string()))?;
+            if tx.tx_id != want {
+                continue;
+            }
             let mut probe = tx.clone();
             let sum = probe.checksum;
             probe.checksum = 0;
             let bytes = serde_json::to_vec(&probe).map_err(|e| JournalError::Codec(e.to_string()))?;
             if checksum(&bytes) != sum {
-                continue;
+                return Err(JournalError::Checksum(0));
             }
             return Ok(tx);
         }
@@ -163,7 +268,7 @@ mod tests {
     use crate::domain::Currency;
 
     fn money() -> Money {
-        Money { amount: 100, currency: Currency::USD }
+        Money { amount: 100, price: 100, quantity: 1, currency: Currency::USD }
     }
 
     #[test]

@@ -3,7 +3,7 @@
 use std::path::PathBuf;
 
 // Reuse the binary crate? Integration tests can't see it — drive over HTTP.
-async fn spawn_app() -> (String, tempfile::TempDir) {
+async fn spawn_app() -> (String, tempfile::TempDir, tokio::process::Child) {
     let dir = tempfile::TempDir::new().unwrap();
     let _path: PathBuf = dir.path().join("journal.wal");
     // Build via the binary: launch `cargo run` equivalent in-process is not
@@ -24,9 +24,10 @@ async fn spawn_app() -> (String, tempfile::TempDir) {
         }
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
-    // Leak the child for the test duration; kill_on_drop cleans up.
-    std::mem::forget(child);
-    (base, dir)
+    // Return the child: dropping it kills the server (kill_on_drop).
+    // Callers must hold it for the whole test — never mem::forget (leaks
+    // the server and locks the exe on Windows), never drop early.
+    (base, dir, child)
 }
 
 fn portpicker_free() -> u16 {
@@ -45,7 +46,7 @@ fn valid_body() -> serde_json::Value {
 
 #[tokio::test]
 async fn valid_payment_accepted_durable() {
-    let (base, _dir) = spawn_app().await;
+    let (base, _dir, _srv) = spawn_app().await;
     let client = reqwest::Client::new();
     let res = client
         .post(format!("{base}/payments"))
@@ -62,7 +63,7 @@ async fn valid_payment_accepted_durable() {
 
 #[tokio::test]
 async fn unbalanced_rejected_with_no_settlement() {
-    let (base, _dir) = spawn_app().await;
+    let (base, _dir, _srv) = spawn_app().await;
     let client = reqwest::Client::new();
     // amount <= 0 is invalid
     let mut bad = valid_body();
@@ -81,7 +82,7 @@ async fn unbalanced_rejected_with_no_settlement() {
 
 #[tokio::test]
 async fn invalid_request_rejected() {
-    let (base, _dir) = spawn_app().await;
+    let (base, _dir, _srv) = spawn_app().await;
     let client = reqwest::Client::new();
     // missing Idempotency-Key header
     let res = client.post(format!("{base}/payments")).json(&valid_body()).send().await.unwrap();

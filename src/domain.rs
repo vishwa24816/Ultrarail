@@ -15,8 +15,12 @@ pub enum Currency {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Money {
-    /// Minor units (cents). Must be > 0.
+    /// Total in minor units (cents). Must equal price * quantity, and be > 0.
     pub amount: i64,
+    /// Unit price in minor units. Part of the transaction value.
+    pub price: i64,
+    /// Number of units. Defaults to 1.
+    pub quantity: u64,
     pub currency: Currency,
 }
 
@@ -53,6 +57,10 @@ pub struct PaymentTx {
 pub enum DomainError {
     #[error("amount must be positive, got {0}")]
     BadAmount(i64),
+    #[error("price must be positive, got {0}")]
+    BadPrice(i64),
+    #[error("amount {amount} != price {price} * quantity {quantity}")]
+    PriceMismatch { amount: i64, price: i64, quantity: u64 },
     #[error("postings do not balance: debits={debits} credits={credits}")]
     Unbalanced { debits: i64, credits: i64 },
     #[error("entry amounts must be non-negative")]
@@ -75,6 +83,19 @@ impl PaymentTx {
     pub fn validate(&self) -> Result<(), DomainError> {
         if self.money.amount <= 0 {
             return Err(DomainError::BadAmount(self.money.amount));
+        }
+        if self.money.price <= 0 {
+            return Err(DomainError::BadPrice(self.money.price));
+        }
+        match self.money.price.checked_mul(self.money.quantity as i64) {
+            Some(total) if total == self.money.amount => {}
+            _ => {
+                return Err(DomainError::PriceMismatch {
+                    amount: self.money.amount,
+                    price: self.money.price,
+                    quantity: self.money.quantity,
+                })
+            }
         }
         let mut debits: i64 = 0;
         let mut credits: i64 = 0;
@@ -106,6 +127,10 @@ pub struct CreatePayment {
     pub credit_account: String,
     pub amount: i64,
     pub currency: Currency,
+    /// Unit price in minor units. Defaults to `amount` (single-unit tx).
+    pub price: Option<i64>,
+    /// Number of units. Defaults to 1.
+    pub quantity: Option<u64>,
 }
 
 #[cfg(test)]
@@ -118,7 +143,7 @@ mod tests {
             idempotency_scope: "payments".into(),
             idempotency_key: "k1".into(),
             request_hash: 42,
-            money: Money { amount: 100, currency: Currency::USD },
+            money: Money { amount: 100, price: 100, quantity: 1, currency: Currency::USD },
             entries: vec![
                 LedgerEntry { account: "user:1".into(), debit: 100, credit: 0 },
                 LedgerEntry { account: "merchant:9".into(), debit: 0, credit: 100 },
@@ -149,5 +174,23 @@ mod tests {
         let mut tx = ok_tx();
         tx.money.amount = 0;
         assert_eq!(tx.validate(), Err(DomainError::BadAmount(0)));
+    }
+
+    #[test]
+    fn price_mismatch_rejected() {
+        let mut tx = ok_tx();
+        tx.money.price = 60; // 60*1 != 100
+        assert_eq!(
+            tx.validate(),
+            Err(DomainError::PriceMismatch { amount: 100, price: 60, quantity: 1 })
+        );
+    }
+
+    #[test]
+    fn price_times_quantity_passes() {
+        let mut tx = ok_tx();
+        tx.money.price = 50;
+        tx.money.quantity = 2;
+        assert!(tx.validate().is_ok());
     }
 }

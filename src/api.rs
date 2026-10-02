@@ -11,6 +11,7 @@ use crate::app_state::AppState;
 use crate::app_state::WriteCmd;
 use crate::domain::{CreatePayment, Currency, Money};
 use crate::metrics;
+use crate::partition;
 
 #[derive(Serialize)]
 struct Accepted {
@@ -61,20 +62,31 @@ async fn create_payment(
             .into_response();
     }
     // Currency deserializes via serde; unknown variants already rejected with 422 by Json extractor.
-    let money = Money { amount: body.amount, currency: body.currency };
+    let money = Money {
+        amount: body.amount,
+        price: body.price.unwrap_or(body.amount),
+        quantity: body.quantity.unwrap_or(1),
+        currency: body.currency,
+    };
     let _ = Currency::USD; // keep import live across refactors
     metrics::observe_validation(t0.elapsed().as_secs_f64() * 1000.0);
 
     let (tx_reply, rx) = oneshot::channel();
+    let n = state.partitions();
+    let bucket = partition::bucket();
+    let p = partition::route(&body.idempotency_scope, &key, &body.debit_account, &body.credit_account, bucket, n);
+    let tx_id = partition::tx_id(bucket, &body.debit_account, &body.credit_account);
     let cmd = WriteCmd {
         scope: body.idempotency_scope,
         key,
         money,
         debit_account: body.debit_account,
         credit_account: body.credit_account,
+        bucket,
+        tx_id,
         reply: tx_reply,
     };
-    if state.tx.send(cmd).await.is_err() {
+    if state.writers[p].send(cmd).await.is_err() {
         return (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({"status":"REJECTED","reason":"writer overloaded"})))
             .into_response();
     }
