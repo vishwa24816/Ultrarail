@@ -4,7 +4,6 @@
 //! acks every event, and asserts balance conservation end to end.
 
 use futures::{SinkExt, StreamExt};
-use tokio_tungstenite::connect_async;
 
 #[tokio::main]
 async fn main() {
@@ -15,8 +14,11 @@ async fn main() {
     let ws_base = base.replace("http", "ws");
 
     // Bank listeners first (both sides), so no event is missed.
-    let (mut bank_user_w, mut bank_user_r) = bank_socket(&ws_base, "user").await;
-    let (mut bank_merch_w, mut bank_merch_r) = bank_socket(&ws_base, "merchant").await;
+    // Owner-bound keys: each side authenticates as itself.
+    let bank_user_key = std::env::var("BANK_KEY_USER").ok();
+    let bank_merch_key = std::env::var("BANK_KEY_MERCHANT").ok();
+    let (mut bank_user_w, mut bank_user_r) = bank_socket(&ws_base, "user", bank_user_key).await;
+    let (mut bank_merch_w, mut bank_merch_r) = bank_socket(&ws_base, "merchant", bank_merch_key).await;
     let (mut cli_w, mut cli_r) = client_socket(&ws_base).await;
 
     if args.iter().any(|a| a == "--terminal") {
@@ -98,16 +100,20 @@ async fn main() {
 
 type WsStream = tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
+fn api_key() -> Option<String> {
+    std::env::var("CLIENT_KEY").or_else(|_| std::env::var("BANK_KEY")).ok()
+}
+
 async fn bank_socket(
     ws_base: &str,
     bank: &str,
+    key: Option<String>,
 ) -> (
     futures::stream::SplitSink<WsStream, tokio_tungstenite::tungstenite::Message>,
     futures::stream::SplitStream<WsStream>,
 ) {
     let url = format!("{ws_base}/ws/bank?bank_id={bank}");
-    let (s, _) = connect_async(&url).await.unwrap_or_else(|_| panic!("connect {url}"));
-    s.split()
+    connect_with_key(&url, key).await
 }
 
 async fn client_socket(
@@ -117,8 +123,79 @@ async fn client_socket(
     futures::stream::SplitStream<WsStream>,
 ) {
     let url = format!("{ws_base}/ws/client");
-    let (s, _) = connect_async(&url).await.unwrap_or_else(|_| panic!("connect {url}"));
+    connect_with_key(&url, api_key()).await
+}
+
+async fn connect_with_key(
+    url: &str,
+    key: Option<String>,
+) -> (
+    futures::stream::SplitSink<WsStream, tokio_tungstenite::tungstenite::Message>,
+    futures::stream::SplitStream<WsStream>,
+) {
+    // Sandbox TLS uses a self-signed fixture: accept invalid certs ONLY here
+    // (test-bank is a rehearsal tool, never production traffic).
+    let connector = url.starts_with("wss").then(|| {
+        let cfg = rustls::ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(std::sync::Arc::new(NoVerify))
+            .with_no_client_auth();
+        tokio_tungstenite::Connector::Rustls(std::sync::Arc::new(cfg))
+    });
+    let mut req = http::Request::builder()
+        .uri(url)
+        .header("host", "127.0.0.1")
+        .header("connection", "Upgrade")
+        .header("upgrade", "websocket")
+        .header("sec-websocket-version", "13")
+        .header("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ==");
+    if let Some(k) = key {
+        req = req.header("x-api-key", k);
+    }
+    let (s, _) = tokio_tungstenite::connect_async_tls_with_config(
+        req.body(()).unwrap(),
+        None,
+        false,
+        connector,
+    )
+    .await
+    .unwrap_or_else(|_| panic!("connect {url} (server down? keys missing/rejected?)"));
     s.split()
+}
+
+#[derive(Debug)]
+struct NoVerify;
+
+impl rustls::client::danger::ServerCertVerifier for NoVerify {
+    fn verify_server_cert(
+        &self,
+        _end: &rustls::pki_types::CertificateDer,
+        _inter: &[rustls::pki_types::CertificateDer],
+        _server: &rustls::pki_types::ServerName,
+        _ocsp: &[u8],
+        _now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+    fn verify_tls12_signature(
+        &self,
+        _msg: &[u8],
+        _cert: &rustls::pki_types::CertificateDer,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+    fn verify_tls13_signature(
+        &self,
+        _msg: &[u8],
+        _cert: &rustls::pki_types::CertificateDer,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        rustls::crypto::ring::default_provider().signature_verification_algorithms.supported_schemes().to_vec()
+    }
 }
 
 type CliW = futures::stream::SplitSink<WsStream, tokio_tungstenite::tungstenite::Message>;

@@ -29,15 +29,22 @@ struct Rejected {
 
 pub fn router(state: AppState) -> Router {
     use tower_http::limit::RequestBodyLimitLayer;
-    let mut r = Router::new()
-        .route("/health", get(|| async { "ok" }))
-        .route("/ready", get(read_ready))
+    let keys = crate::auth::KeySets::from_env();
+    let client = Router::new()
         .route("/payments", axum::routing::post(create_payment))
         .route("/dlq", get(read_dlq))
         .route("/audit", get(read_audit))
         .route("/payments/:id", get(read_payment))
         .route("/ws/client", get(crate::ws::ws_client))
-        .route("/ws/bank", get(crate::ws::ws_bank));
+        .route_layer(axum::middleware::from_fn_with_state(keys.clone(), crate::auth::client_auth));
+    let bank = Router::new()
+        .route("/ws/bank", get(crate::ws::ws_bank))
+        .route_layer(axum::middleware::from_fn_with_state(keys.clone(), crate::auth::bank_auth));
+    let mut r = Router::new()
+        .route("/health", get(|| async { "ok" }))
+        .route("/ready", get(read_ready))
+        .merge(client)
+        .merge(bank);
     // Sandbox-only shutdown hook: same code path as SIGTERM. Never enable in prod.
     if std::env::var("PAYMENT_TEST_HOOKS").as_deref() == Ok("true") {
         r = r.route("/test/shutdown", axum::routing::post(test_shutdown));

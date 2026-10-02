@@ -213,12 +213,19 @@ pub async fn ws_client(State(state): State<AppState>, ws: WebSocketUpgrade) -> i
 pub async fn ws_bank(
     State(state): State<AppState>,
     Query(q): Query<HashMap<String, String>>,
+    owner: Option<axum::extract::Extension<crate::auth::BankOwner>>,
     ws: WebSocketUpgrade,
 ) -> impl IntoResponse {
     let bank = q.get("bank_id").cloned().unwrap_or_default();
     // Localhost only; Phase 5 adds authN. Allowlist keeps routing keys sane.
     if bank.is_empty() || !validate_account(&bank) {
         return axum::http::StatusCode::BAD_REQUEST.into_response();
+    }
+    // A bank key listens only as its owner (no cross-bank snooping).
+    if let Some(axum::extract::Extension(o)) = owner {
+        if o.0 != bank {
+            return axum::http::StatusCode::UNAUTHORIZED.into_response();
+        }
     }
     ws.on_upgrade(|socket| async move {
         let (mut send, mut recv) = socket.split();

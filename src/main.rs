@@ -2,6 +2,7 @@ mod accounts;
 mod api;
 mod app_state;
 mod audit;
+mod auth;
 mod config;
 mod delivery;
 mod dlq;
@@ -23,6 +24,9 @@ extern crate metrics as metrics_core;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Explicit crypto provider: the tree contains both ring and aws-lc,
+    // so rustls cannot auto-pick one.
+    let _ = rustls::crypto::ring::default_provider().install_default();
     tracing_subscriber::fmt().with_env_filter("payment_rail=debug,tower_http=info").init();
     // NOTE: binds localhost only until 03-04 lands TLS+auth — do not expose publicly as-is.
     let cfg = config::Config::from_env().expect("invalid config");
@@ -78,23 +82,43 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
     let app = api::router(state.clone());
     let addr: SocketAddr = cfg.listen_addr.parse().expect("LISTEN_ADDR");
-    tracing::info!("listening on {addr}");
-    let listener = tokio::net::TcpListener::bind(addr).await.expect("bind");
+    let handle = axum_server::Handle::new();
+    let shutdown_handle = handle.clone();
     let mut hook_rx = shutdown_tx.subscribe();
     // SIGTERM: stop intake, drain batches, final syncs, exit (deadline enforced).
     // The test hook (/test/shutdown) drives this same path via the watch channel.
-    axum::serve(listener, app)
-        .with_graceful_shutdown(async move {
-            tokio::select! {
-                _ = tokio::signal::ctrl_c() => {},
-                _ = hook_rx.wait_for(|v| *v) => {},
+    tokio::spawn(async move {
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {},
+            _ = hook_rx.wait_for(|v| *v) => {},
+        }
+        tracing::info!("shutdown signal: draining");
+        draining.store(true, Ordering::Relaxed);
+        let _ = shutdown_tx.send(true);
+        shutdown_handle.graceful_shutdown(Some(Duration::from_secs(30)));
+    });
+    let use_tls = std::env::var("PAYMENT_TLS_CERT").ok().or_else(|| std::env::var("TLS_CERT").ok());
+    let use_key = std::env::var("PAYMENT_TLS_KEY").ok().or_else(|| std::env::var("TLS_KEY").ok());
+    match (use_tls, use_key) {
+        (Some(cert), Some(key)) => {
+            tracing::info!("TLS on {addr}");
+            let tls = axum_server::tls_rustls::RustlsConfig::from_pem_file(cert, key)
+                .await
+                .expect("TLS cert/key");
+            axum_server::bind_rustls(addr, tls).handle(handle).serve(app.into_make_service()).await.expect("serve");
+        }
+        _ => {
+            if std::env::var("PAYMENT_TLS_OFF").as_deref() == Ok("true")
+                || std::env::var("TLS_OFF").as_deref() == Ok("true")
+            {
+                tracing::warn!("TLS_OFF=true: plaintext sandbox listener on {addr}");
+            } else {
+                tracing::warn!("no TLS cert configured: plaintext listener on {addr} (sandbox only, do not expose)");
             }
-            tracing::info!("shutdown signal: draining");
-            draining.store(true, Ordering::Relaxed);
-            let _ = shutdown_tx.send(true);
-        })
-        .await
-        .expect("serve");
+            tracing::info!("listening on {addr}");
+            axum_server::bind(addr).handle(handle).serve(app.into_make_service()).await.expect("serve");
+        }
+    }
     let deadline = Duration::from_secs(cfg.shutdown_deadline_secs);
     let ok = tokio::time::timeout(deadline, async {
         for h in supervisors {
