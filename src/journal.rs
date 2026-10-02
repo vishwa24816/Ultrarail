@@ -31,14 +31,30 @@ fn checksum(bytes: &[u8]) -> u32 {
 /// Durable journal. Single writer only — share via mpsc, never Arc<Mutex>.
 pub struct Journal {
     wal: Wal,
-    tx_index: BTreeMap<String, u64>,   // tx_id -> lsn
-    idem_index: BTreeMap<(String, String), String>, // (scope,key) -> tx_id
+    tx_index: BTreeMap<String, u64>, // tx_id -> lsn
+    idem_index: BTreeMap<(String, String), IdemRec>,
+    ttl_ms: u64,
+    last_sweep: std::time::Instant,
+}
+
+#[derive(Debug, Clone)]
+struct IdemRec {
+    tx_id: String,
+    expires_ms: u64,
+}
+
+/// What prepare() found: a live key, an expired key (treated as new, logged to DLQ), or nothing.
+pub struct Prepared {
+    pub staged: Staged,
+    /// Old tx_id when the key existed but expired — writer logs it to the DLQ.
+    pub expired_old_tx: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy)]
 pub struct AcceptOutcome {
     pub lsn: u64,
     pub durable: bool,
+    pub replayed: bool,
 }
 
 /// A validated tx waiting for its batch's sync.
@@ -54,15 +70,33 @@ enum StagedKind {
 
 impl Journal {
     pub fn open(path: &Path) -> Result<Self, JournalError> {
+        let ttl_ms = std::env::var("IDEM_TTL_SECS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(86400)
+            * 1000;
         let wal = Wal::open(path)?;
-        let mut j = Self { wal, tx_index: BTreeMap::new(), idem_index: BTreeMap::new() };
-        j.replay()?;
+        let mut j = Self {
+            wal,
+            tx_index: BTreeMap::new(),
+            idem_index: BTreeMap::new(),
+            ttl_ms,
+            last_sweep: std::time::Instant::now(),
+        };
+        let counts = j.replay()?;
+        tracing::info!("replayed {} records ({} expired dropped)", counts.0, counts.1);
         Ok(j)
     }
 
-    /// Idempotency lookup before doing any work.
+    /// Idempotency lookup. Expired keys behave as misses (caller treats as new).
     pub fn lookup(&self, scope: &str, key: &str) -> Option<&String> {
-        self.idem_index.get(&(scope.to_string(), key.to_string()))
+        self.idem_index.get(&(scope.to_string(), key.to_string())).and_then(|r| {
+            if r.expires_ms > now_ms() {
+                Some(&r.tx_id)
+            } else {
+                None
+            }
+        })
     }
 
     pub fn get(&self, tx_id: &str) -> Option<u64> {
@@ -80,11 +114,34 @@ impl Journal {
         credit_account: String,
         bucket: u64,
         tx_id: String,
-    ) -> Result<Staged, JournalError> {
-        if let Some(existing) = self.lookup(&scope, &key) {
-            let tx = self.read_tx(existing)?;
-            return Ok(Staged::Replay(tx));
+    ) -> Result<Prepared, JournalError> {
+        let k = (scope.clone(), key.clone());
+        if let Some(rec) = self.idem_index.get(&k).cloned() {
+            if rec.expires_ms > now_ms() {
+                let tx = self.read_tx(&rec.tx_id)?;
+                return Ok(Prepared { staged: Staged::Replay(tx), expired_old_tx: None });
+            }
+            // Expired: fall through as a FRESH payment, but report the old id for the DLQ.
+            let old = Some(rec.tx_id);
+            return self.prepare_fresh(scope, key, money, debit_account, credit_account, tx_id, bucket).map(
+                |staged| Prepared { staged, expired_old_tx: old },
+            );
         }
+        self.prepare_fresh(scope, key, money, debit_account, credit_account, tx_id, bucket)
+            .map(|staged| Prepared { staged, expired_old_tx: None })
+    }
+
+    fn prepare_fresh(
+        &mut self,
+        scope: String,
+        key: String,
+        money: Money,
+        debit_account: String,
+        credit_account: String,
+        tx_id: String,
+        _bucket: u64,
+    ) -> Result<Staged, JournalError> {
+        let _ = self.ttl_ms;
         let entries = vec![
             LedgerEntry { account: debit_account, debit: money.amount, credit: 0 },
             LedgerEntry { account: credit_account, debit: 0, credit: money.amount },
@@ -106,7 +163,6 @@ impl Journal {
         let mut bytes = serde_json::to_vec(&tx).map_err(|e| JournalError::Codec(e.to_string()))?;
         tx.checksum = checksum(&bytes);
         bytes = serde_json::to_vec(&tx).map_err(|e| JournalError::Codec(e.to_string()))?;
-        let _ = bucket; // embedded in tx_id already; kept for future bucketed segments
         Ok(Staged::Fresh(tx, bytes))
     }
 
@@ -136,7 +192,7 @@ impl Journal {
             return kinds
                 .into_iter()
                 .map(|k| match k {
-                    StagedKind::Replay(tx) => Ok((tx, AcceptOutcome { lsn: 0, durable: true })),
+                    StagedKind::Replay(tx) => Ok((tx, AcceptOutcome { lsn: 0, durable: true, replayed: true })),
                     StagedKind::Fresh(_) => unreachable!(),
                 })
                 .collect();
@@ -150,7 +206,7 @@ impl Journal {
                     return kinds
                         .into_iter()
                         .map(|k| match k {
-                            StagedKind::Replay(tx) => Ok((tx, AcceptOutcome { lsn: 0, durable: true })),
+                            StagedKind::Replay(tx) => Ok((tx, AcceptOutcome { lsn: 0, durable: true, replayed: true })),
                             StagedKind::Fresh(_) => Err(JournalError::Codec(err.clone())),
                         })
                         .collect();
@@ -163,7 +219,7 @@ impl Journal {
             return kinds
                 .into_iter()
                 .map(|k| match k {
-                    StagedKind::Replay(tx) => Ok((tx, AcceptOutcome { lsn: 0, durable: true })),
+                    StagedKind::Replay(tx) => Ok((tx, AcceptOutcome { lsn: 0, durable: true, replayed: true })),
                     StagedKind::Fresh(_) => Err(JournalError::Codec(err.clone())),
                 })
                 .collect();
@@ -175,16 +231,16 @@ impl Journal {
             self.tx_index.insert(tx.tx_id.clone(), lsn);
             self.idem_index.insert(
                 (tx.idempotency_scope.clone(), tx.idempotency_key.clone()),
-                tx.tx_id.clone(),
+                IdemRec { tx_id: tx.tx_id.clone(), expires_ms: tx.timestamp_ms.saturating_add(self.ttl_ms) },
             );
         }
         kinds
             .into_iter()
             .map(|k| match k {
-                StagedKind::Replay(tx) => Ok((tx, AcceptOutcome { lsn: 0, durable: true })),
+                StagedKind::Replay(tx) => Ok((tx, AcceptOutcome { lsn: 0, durable: true, replayed: true })),
                 StagedKind::Fresh(i) => {
                     let (tx, _) = &pending[i];
-                    Ok((tx.clone(), AcceptOutcome { lsn: self.tx_index[&tx.tx_id], durable: true }))
+                    Ok((tx.clone(), AcceptOutcome { lsn: self.tx_index[&tx.tx_id], durable: true, replayed: false }))
                 }
             })
             .collect()
@@ -201,8 +257,8 @@ impl Journal {
     ) -> Result<(PaymentTx, AcceptOutcome), JournalError> {
         let bucket = 0;
         let tx_id = uuid::Uuid::now_v7().to_string();
-        let staged = self.prepare(scope, key, money, debit_account, credit_account, bucket, tx_id)?;
-        let mut out = self.commit_batch(vec![staged]);
+        let p = self.prepare(scope, key, money, debit_account, credit_account, bucket, tx_id)?;
+        let mut out = self.commit_batch(vec![p.staged]);
         out.pop().unwrap()
     }
 
@@ -226,9 +282,11 @@ impl Journal {
         Err(JournalError::Codec("tx not found".into()))
     }
 
-    /// Replay all durable records; rebuild indexes. Stops at first corrupt record.
-    fn replay(&mut self) -> Result<usize, JournalError> {
+    /// Replay all durable records; rebuild indexes. Expired idempotency keys are
+    /// dropped (counted). Returns (live, expired_dropped).
+    fn replay(&mut self) -> Result<(usize, usize), JournalError> {
         let mut n = 0;
+        let mut dropped = 0;
         let records: Vec<Vec<u8>> = {
             let mut v = Vec::new();
             for entry in self.wal.iter()? {
@@ -247,14 +305,28 @@ impl Journal {
             if checksum(&bytes) != sum {
                 return Err(JournalError::Checksum(i as u64));
             }
-            self.idem_index.insert(
-                (tx.idempotency_scope.clone(), tx.idempotency_key.clone()),
-                tx.tx_id.clone(),
-            );
             self.tx_index.insert(tx.tx_id.clone(), i as u64);
-            n += 1;
+            if tx.timestamp_ms.saturating_add(self.ttl_ms) > now_ms() {
+                self.idem_index.insert(
+                    (tx.idempotency_scope.clone(), tx.idempotency_key.clone()),
+                    IdemRec { tx_id: tx.tx_id.clone(), expires_ms: tx.timestamp_ms.saturating_add(self.ttl_ms) },
+                );
+                n += 1;
+            } else {
+                dropped += 1;
+            }
         }
-        Ok(n)
+        Ok((n, dropped))
+    }
+
+    /// Drop expired idempotency keys, at most once per 60s. Called per writer batch.
+    pub fn sweep_if_due(&mut self) {
+        if self.last_sweep.elapsed().as_secs() < 60 {
+            return;
+        }
+        self.last_sweep = std::time::Instant::now();
+        let now = now_ms();
+        self.idem_index.retain(|_, r| r.expires_ms > now);
     }
 
     pub fn len(&self) -> usize {

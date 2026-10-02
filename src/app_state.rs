@@ -3,10 +3,12 @@
 //! Each writer drains its queue per wake and pays ONE sync per batch (group commit).
 
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use tokio::sync::{mpsc, oneshot};
 
+use crate::dlq::{now_ms, Dlq, DlqEntry};
 use crate::domain::Money;
 use crate::journal::{Journal, JournalError, Staged};
 use crate::metrics;
@@ -20,12 +22,16 @@ pub struct WriteCmd {
     pub credit_account: String,
     pub bucket: u64,
     pub tx_id: String,
-    pub reply: oneshot::Sender<Result<(String, u64), String>>,
+    pub reply: oneshot::Sender<CmdResult>,
 }
+
+/// (tx_id, lsn, replayed?) — replayed tells the client `replayed` vs `fresh`.
+pub type CmdResult = Result<(String, u64, bool), String>;
 
 #[derive(Clone)]
 pub struct AppState {
     pub writers: Vec<mpsc::Sender<WriteCmd>>,
+    pub dlq: Arc<Mutex<Dlq>>,
 }
 
 impl AppState {
@@ -42,7 +48,11 @@ pub fn partition_count() -> usize {
         .max(1)
 }
 
-fn spawn_one(journal_path: PathBuf, id: usize) -> Result<mpsc::Sender<WriteCmd>, JournalError> {
+fn spawn_one(
+    journal_path: PathBuf,
+    id: usize,
+    dlq: Arc<Mutex<Dlq>>,
+) -> Result<mpsc::Sender<WriteCmd>, JournalError> {
     let (tx, mut rx) = mpsc::channel::<WriteCmd>(1024);
     let mut journal = Journal::open(&journal_path)?;
     tracing::info!("partition {id}: replayed {} records", journal.len());
@@ -58,6 +68,7 @@ fn spawn_one(journal_path: PathBuf, id: usize) -> Result<mpsc::Sender<WriteCmd>,
                 cmds.push(c);
             }
             let t0 = Instant::now();
+            journal.sweep_if_due();
             // Prepare each cmd (validation, in-memory). Failures reply immediately;
             // successes join one group-commit batch.
             let mut idx: Vec<usize> = Vec::new();
@@ -73,16 +84,43 @@ fn spawn_one(journal_path: PathBuf, id: usize) -> Result<mpsc::Sender<WriteCmd>,
                     c.bucket,
                     c.tx_id.clone(),
                 ) {
-                    Ok(s) => {
+                    Ok(p) => {
+                        if let Some(old) = p.expired_old_tx {
+                            // Post-TTL retry: new payment, but leave an audit trail.
+                            if let Ok(mut d) = dlq.lock() {
+                                d.push(DlqEntry {
+                                    reason: "key-expired-replayed".into(),
+                                    scope: c.scope.clone(),
+                                    key: c.key.clone(),
+                                    tx_id: Some(old),
+                                    detail: format!("expired key reused as fresh by partition {id}"),
+                                    at_ms: now_ms(),
+                                });
+                            }
+                        }
                         idx.push(i);
-                        staged.push(s);
+                        staged.push(p.staged);
                     }
                     Err(e) => early.push((i, e.to_string())),
                 }
             }
+            // Validation failures are operator-visible via the DLQ (best-effort).
+            for (e_i, msg) in &early {
+                let c = &cmds[*e_i];
+                if let Ok(mut d) = dlq.lock() {
+                    d.push(DlqEntry {
+                        reason: "validation-failed".into(),
+                        scope: c.scope.clone(),
+                        key: c.key.clone(),
+                        tx_id: None,
+                        detail: msg.clone(),
+                        at_ms: now_ms(),
+                    });
+                }
+            }
             let results = journal.commit_batch(staged);
             metrics::observe_journal_sync(t0.elapsed().as_secs_f64() * 1000.0);
-            let mut by_cmd: Vec<Option<Result<(String, u64), String>>> = (0..cmds.len()).map(|_| None).collect();
+            let mut by_cmd: Vec<Option<CmdResult>> = (0..cmds.len()).map(|_| None).collect();
             for (e_i, msg) in early {
                 metrics::count_rejected();
                 by_cmd[e_i] = Some(Err(msg));
@@ -91,7 +129,7 @@ fn spawn_one(journal_path: PathBuf, id: usize) -> Result<mpsc::Sender<WriteCmd>,
                 by_cmd[k] = Some(match res {
                     Ok((tx, o)) => {
                         metrics::count_accepted();
-                        Ok((tx.tx_id, o.lsn))
+                        Ok((tx.tx_id, o.lsn, o.replayed))
                     }
                     Err(e) => {
                         metrics::count_rejected();
@@ -107,12 +145,17 @@ fn spawn_one(journal_path: PathBuf, id: usize) -> Result<mpsc::Sender<WriteCmd>,
     Ok(tx)
 }
 
-/// Open N partitions under `dir` as `journal-{i}.wal`. Fail-closed: any bad partition aborts boot.
-pub fn spawn_writers(dir: PathBuf, n: usize) -> Result<Vec<mpsc::Sender<WriteCmd>>, JournalError> {
+/// Open N partitions under `dir` as `journal-{i}.wal` plus a shared `dlq.wal`.
+/// Fail-closed: any bad partition aborts boot.
+pub fn spawn_writers(
+    dir: PathBuf,
+    n: usize,
+) -> Result<(Vec<mpsc::Sender<WriteCmd>>, Arc<Mutex<Dlq>>), JournalError> {
+    let dlq = Arc::new(Mutex::new(Dlq::open(&dir.join("dlq.wal")).map_err(|e| JournalError::Codec(e.to_string()))?));
     let mut out = Vec::with_capacity(n);
     for i in 0..n {
-        out.push(spawn_one(dir.join(format!("journal-{i}.wal")), i)?);
+        out.push(spawn_one(dir.join(format!("journal-{i}.wal")), i, dlq.clone())?);
     }
     let _ = partition::bucket; // router lives in api; keep import graph honest
-    Ok(out)
+    Ok((out, dlq))
 }

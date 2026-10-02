@@ -3,15 +3,21 @@
 use std::path::PathBuf;
 
 async fn spawn_on(dir: &std::path::Path) -> (String, tokio::process::Child) {
+    spawn_on_with(dir, &[]).await
+}
+
+async fn spawn_on_with(dir: &std::path::Path, extra_env: &[(&str, &str)]) -> (String, tokio::process::Child) {
     let bin = env!("CARGO_BIN_EXE_payment-rail");
     let port: u16 = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
-    let mut child = tokio::process::Command::new(bin)
-        .env("JOURNAL_DIR", dir)
+    let mut cmd = tokio::process::Command::new(bin);
+    cmd.env("JOURNAL_DIR", dir)
         .env("LISTEN_ADDR", format!("127.0.0.1:{port}"))
         .env("PARTITIONS", "4")
-        .kill_on_drop(true)
-        .spawn()
-        .expect("spawn server");
+        .kill_on_drop(true);
+    for (k, v) in extra_env {
+        cmd.env(k, v);
+    }
+    let mut child = cmd.spawn().expect("spawn server");
     let base = format!("http://127.0.0.1:{port}");
     let client = reqwest::Client::new();
     for _ in 0..200 {
@@ -84,4 +90,61 @@ async fn torn_tail_discarded() {
     let (base2, _child2) = spawn_on(dir.path()).await;
     let got = post(&client, &base2, "torn-1", 7).await;
     assert_eq!(got, first, "good record lost after torn tail");
+}
+
+#[tokio::test]
+async fn ttl_expiry_returns_fresh_and_dlq_logs() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let client = reqwest::Client::new();
+    let (base, _child) = spawn_on_with(dir.path(), &[("IDEM_TTL_SECS", "1")]).await;
+    let body = serde_json::json!({
+        "idempotency_scope": "ttl",
+        "debit_account": "user:1",
+        "credit_account": "m:9",
+        "amount": 100,
+        "currency": "USD",
+    });
+    let once = client
+        .post(format!("{base}/payments"))
+        .header("Idempotency-Key", "ttl-1")
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(once.status(), 201);
+    let v1: serde_json::Value = once.json().await.unwrap();
+    assert_eq!(v1["idempotency"], "fresh");
+    // Within TTL: same key replays the ORIGINAL tx.
+    let twice = client
+        .post(format!("{base}/payments"))
+        .header("Idempotency-Key", "ttl-1")
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    let v2: serde_json::Value = twice.json().await.unwrap();
+    assert_eq!(v2["idempotency"], "replayed");
+    assert_eq!(v2["tx_id"], v1["tx_id"]);
+    // Past TTL: same key is a NEW payment, flagged fresh, old id in DLQ.
+    tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+    let thrice = client
+        .post(format!("{base}/payments"))
+        .header("Idempotency-Key", "ttl-1")
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    let v3: serde_json::Value = thrice.json().await.unwrap();
+    assert_eq!(v3["idempotency"], "fresh");
+    assert_ne!(v3["tx_id"], v1["tx_id"]);
+    let dlq: serde_json::Value =
+        client.get(format!("{base}/dlq?limit=50")).send().await.unwrap().json().await.unwrap();
+    let hits: Vec<&serde_json::Value> = dlq
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|e| e["reason"] == "key-expired-replayed" && e["key"] == "ttl-1")
+        .collect();
+    assert_eq!(hits.len(), 1, "expected one DLQ entry, got {dlq}");
+    assert_eq!(hits[0]["tx_id"], v1["tx_id"]);
 }

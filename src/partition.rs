@@ -32,8 +32,10 @@ pub fn tx_id(bucket: u64, sender: &str, receiver: &str) -> String {
             .take(32)
             .collect::<String>()
     };
+    // uuidv7 high bits are timestamp (constant for weeks) — uniqueness lives in the LOW bits.
     let unique = uuid::Uuid::now_v7().to_string().replace('-', "");
-    format!("{}-{}-{}-{}", bucket, clean(sender), clean(receiver), &unique[..8])
+    let rand12 = &unique[20..]; // 48 random bits
+    format!("{}-{}-{}-{}", bucket, clean(sender), clean(receiver), rand12)
 }
 
 #[cfg(test)]
@@ -63,5 +65,12 @@ mod tests {
     fn tx_id_embeds_fields() {
         let id = tx_id(999, "user:1", "m:9");
         assert!(id.starts_with("999-user:1-m:9-"), "{id}");
+    }
+
+    #[test]
+    fn tx_ids_unique() {
+        let a = tx_id(999, "user:1", "m:9");
+        let b = tx_id(999, "user:1", "m:9");
+        assert_ne!(a, b, "ids must differ even for identical inputs");
     }
 }
