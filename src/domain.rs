@@ -31,13 +31,20 @@ pub struct LedgerEntry {
     pub credit: i64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum TxStatus {
     Received,
     Validated,
     AcceptedDurable,
     Rejected,
+    /// Submitted to rail, outcome unknown — reconcile before resubmitting.
+    Unknown,
+    /// Rail confirmed. Terminal.
+    Settled,
+    /// Terminal failure with reason code (INSUFFICIENT_FUNDS, RISKY_CLIENT,
+    /// FROZEN_DEBIT, FROZEN_CREDIT, FROZEN_TOTAL). Never retried.
+    Failed(String),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

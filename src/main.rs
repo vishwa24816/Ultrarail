@@ -1,7 +1,10 @@
+mod accounts;
 mod api;
 mod app_state;
+mod delivery;
 mod dlq;
 mod domain;
+mod events;
 mod journal;
 mod metrics;
 mod partition;
@@ -25,6 +28,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         dlq: w.dlq,
         bcast: w.bcast,
         pending: w.pending.clone(),
+        registry: w.registry,
+        failed_tx: w.failed_bcast,
+        store: w.store,
+        events: w.events,
     };
     crate::ws::spawn_ack_sweeper(state.clone());
     let app = api::router(state);

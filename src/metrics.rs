@@ -19,3 +19,19 @@ pub fn count_accepted() {
 pub fn count_rejected() {
     metrics::counter!("payments_rejected_total").increment(1);
 }
+
+pub fn delivery_attempt(kind: &str) {
+    metrics::counter!("delivery_attempts_total", "kind" => kind.to_string()).increment(1);
+}
+
+pub fn delivery_settled() {
+    metrics::counter!("delivery_settled_total").increment(1);
+}
+
+pub fn delivery_failed(reason: &str) {
+    metrics::counter!("delivery_failed_total", "reason" => reason.to_string()).increment(1);
+}
+
+pub fn delivery_unknown() {
+    metrics::counter!("delivery_unknown_total").increment(1);
+}

@@ -11,6 +11,7 @@ use futures::{SinkExt, StreamExt};
 use tokio::sync::{broadcast, oneshot};
 
 use crate::app_state::{AppState, WriteCmd};
+use crate::accounts::Terminal;
 use crate::dlq::{now_ms, DlqEntry};
 use crate::domain::{validate_account, CreatePayment, Money};
 use crate::metrics;
@@ -88,6 +89,17 @@ pub fn publish(
 
 fn ack_timeout() -> u64 {
     std::env::var("ACK_TIMEOUT_SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(ACK_TIMEOUT_SECS)
+}
+
+fn parse_terminal(reason: &str) -> Option<Terminal> {
+    match reason {
+        "INSUFFICIENT_FUNDS" => Some(Terminal::InsufficientFunds),
+        "RISKY_CLIENT" => Some(Terminal::RiskyClient),
+        "FROZEN_DEBIT" => Some(Terminal::FrozenDebit),
+        "FROZEN_CREDIT" => Some(Terminal::FrozenCredit),
+        "FROZEN_TOTAL" => Some(Terminal::FrozenTotal),
+        _ => None,
+    }
 }
 
 /// Sweeper: unacked bank deliveries past deadline go to the DLQ. Spawn once at boot.
@@ -240,6 +252,31 @@ pub async fn ws_bank(
                             if let Ok(v) = serde_json::from_str::<serde_json::Value>(&t) {
                                 if v["ack"] == true {
                                     if let Some(id) = v["tx_id"].as_str() {
+                                        if let Ok(mut m) = state.pending.lock() {
+                                            m.remove(&format!("{bank}:{id}"));
+                                        }
+                                    }
+                                } else if v["type"] == "balance.update" {
+                                    if let (Some(acct), Some(bal)) =
+                                        (v["account"].as_str(), v["balance"].as_i64())
+                                    {
+                                        state.registry.set_balance(acct, bal);
+                                    }
+                                } else if v["type"] == "account.flag" {
+                                    if let (Some(acct), Some(flag), Some(on)) = (
+                                        v["account"].as_str(),
+                                        v["flag"].as_str(),
+                                        v["on"].as_bool(),
+                                    ) {
+                                        state.registry.set_flag(acct, flag, on);
+                                    }
+                                } else if v["type"] == "tx.failed" {
+                                    if let (Some(id), Some(reason)) =
+                                        (v["tx_id"].as_str(), v["reason"].as_str())
+                                    {
+                                        if let Some(term) = parse_terminal(reason) {
+                                            let _ = state.failed_tx.send((id.to_string(), term));
+                                        }
                                         if let Ok(mut m) = state.pending.lock() {
                                             m.remove(&format!("{bank}:{id}"));
                                         }

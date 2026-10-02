@@ -19,6 +19,11 @@ async fn main() {
     let (mut bank_merch_w, mut bank_merch_r) = bank_socket(&ws_base, "merchant").await;
     let (mut cli_w, mut cli_r) = client_socket(&ws_base).await;
 
+    if args.iter().any(|a| a == "--terminal") {
+        terminal_scenarios(&base, &mut bank_user_w, &mut cli_w, &mut cli_r).await;
+        return;
+    }
+
     let mut submitted: Vec<(String, i64)> = Vec::with_capacity(n);
     let mut receipts = 0;
     for i in 0..n {
@@ -114,4 +119,73 @@ async fn client_socket(
     let url = format!("{ws_base}/ws/client");
     let (s, _) = connect_async(&url).await.unwrap_or_else(|_| panic!("connect {url}"));
     s.split()
+}
+
+type CliW = futures::stream::SplitSink<WsStream, tokio_tungstenite::tungstenite::Message>;
+type CliR = futures::stream::SplitStream<WsStream>;
+
+/// Terminal-failure rehearsal: frozen account + low balance fail WITHOUT retry.
+async fn terminal_scenarios(base: &str, bank_w: &mut CliW, cli_w: &mut CliW, cli_r: &mut CliR) {
+    use tokio_tungstenite::tungstenite::Message;
+    let client = reqwest::Client::new();
+
+    // Freeze user:99 totally via bank WS.
+    bank_w
+        .send(Message::Text(
+            r#"{"type":"account.flag","account":"user:99","flag":"totally_frozen","on":true}"#.into(),
+        ))
+        .await
+        .unwrap();
+    // Low balance for user:98.
+    bank_w
+        .send(Message::Text(r#"{"type":"balance.update","account":"user:98","balance":5}"#.into()))
+        .await
+        .unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    for (i, debit, amount, want) in [
+        (0, "user:99", 100, "FROZEN_TOTAL"),
+        (1, "user:98", 100, "INSUFFICIENT_FUNDS"),
+    ] {
+        let req = serde_json::json!({
+            "action": "submit",
+            "idempotency_scope": "terminal",
+            "idempotency_key": format!("term-{i}"),
+            "debit_account": debit,
+            "credit_account": "merchant:1",
+            "amount": amount,
+            "currency": "USD",
+        });
+        cli_w.send(Message::Text(req.to_string().into())).await.unwrap();
+        let msg = cli_r.next().await.unwrap().unwrap();
+        let v: serde_json::Value = serde_json::from_str(msg.to_text().unwrap()).unwrap();
+        assert_eq!(v["status"], "ACCEPTED_DURABLE", "accept first, fail in delivery: {v}");
+        let tx_id = v["tx_id"].as_str().unwrap().to_string();
+        // Poll status until terminal FAILED.
+        let mut state = String::new();
+        let mut events = vec![];
+        for _ in 0..100 {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            let s: serde_json::Value =
+                client.get(format!("{base}/payments/{tx_id}")).send().await.unwrap().json().await.unwrap();
+            state = s["delivery_state"].as_str().unwrap_or("").to_string();
+            events = s["events"].as_array().cloned().unwrap_or_default();
+            if state == "Failed" {
+                break;
+            }
+        }
+        assert_eq!(state, "Failed", "tx {tx_id} must end FAILED, got {state}");
+        let failed = events.iter().find(|e| e["kind"] == "failed").expect("failed event");
+        let detail = failed["detail"].as_str().unwrap_or("");
+        assert!(
+            detail.contains(&format!("transaction failed for {want}")),
+            "message must name the flag, got: {detail}"
+        );
+        assert!(
+            !events.iter().any(|e| e["kind"] == "attempt"),
+            "terminal failures must not attempt the rail: {events:?}"
+        );
+        println!("terminal case {want}: FAILED as required, zero rail attempts");
+    }
+    println!("PASS: terminal failures fail fast without retry");
 }

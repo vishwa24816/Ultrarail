@@ -332,6 +332,16 @@ impl Journal {
     pub fn len(&self) -> usize {
         self.tx_index.len()
     }
+
+    /// All durable tx ids (for delivery re-queue on boot).
+    pub fn tx_list(&self) -> Vec<(String, u64)> {
+        self.tx_index.iter().map(|(k, v)| (k.clone(), *v)).collect()
+    }
+
+    /// Public read for boot re-queue (validates checksum).
+    pub fn read_tx_public(&self, tx_id: &str) -> Result<PaymentTx, JournalError> {
+        self.read_tx(tx_id)
+    }
 }
 
 #[cfg(test)]

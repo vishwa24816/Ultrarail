@@ -33,6 +33,7 @@ pub fn router(state: AppState) -> Router {
         .route("/health", get(|| async { "ok" }))
         .route("/payments", axum::routing::post(create_payment))
         .route("/dlq", get(read_dlq))
+        .route("/payments/:id", get(read_payment))
         .route("/ws/client", get(crate::ws::ws_client))
         .route("/ws/bank", get(crate::ws::ws_bank))
         .layer(RequestBodyLimitLayer::new(64 * 1024))
@@ -40,6 +41,30 @@ pub fn router(state: AppState) -> Router {
         .with_state(state)
 }
 
+async fn read_payment(
+    State(state): State<AppState>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> impl IntoResponse {
+    let stored = state.store.lock().ok().and_then(|s| s.get(&id).cloned());
+    match stored {
+        None => (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "unknown tx"}))).into_response(),
+        Some(st) => {
+            let mut evs = vec![];
+            if st.partition < state.events.len() {
+                evs = crate::delivery::Delivery::snapshot(&state.events[st.partition], &id);
+            }
+            let last = evs.last().map(|e| format!("{:?}", e.kind)).unwrap_or_else(|| "ACCEPTED".into());
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "tx": st.tx, "lsn": st.lsn, "partition": st.partition,
+                    "delivery_state": last, "events": evs,
+                })),
+            )
+                .into_response()
+        }
+    }
+}
 async fn read_dlq(
     State(state): State<AppState>,
     axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>,
