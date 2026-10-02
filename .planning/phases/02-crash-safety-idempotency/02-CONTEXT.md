@@ -24,6 +24,12 @@ Refactor single-writer journal into a partitioned multi-writer pipeline; prove k
 - **D-08:** Dead-letter queue: retries/expiries that can't resolve (e.g. key expired but client retries expecting original, or poison records failing validation on replay) go to a DLQ journal segment with reason + original payload, visible to operators. DLQ is append-only, never auto-retried.
 - **D-09:** Same scope+key within TTL returns the original tx (no duplicate payment). After TTL, same key is treated as a new payment — document this contract in the API response/header.
 
+### Bank connectivity (websockets, both sides)
+- **D-10:** Two websocket planes on axum (`WebSocketUpgrade`, no new framework): client WS (`/ws/client`) for submit + receipts, bank WS (`/ws/bank`) for settlement events. HTTP POST stays as fallback.
+- **D-11:** Acked delivery: rail streams `{tx_id, status, money, entries}` per event; bank replies `{tx_id, ack}`. Unacked past timeout → DLQ with reason `bank-no-ack` (feeds D-08).
+- **D-12:** Dummy test bank = in-repo binary (`src/bin/test-bank.rs`) playing BOTH sides: connects as sender-bank and receiver-bank, validates receipts against submitted amounts, sends acks, asserts balance conservation. Production-level rehearsal harness, owned by Phase 2.
+- **D-13:** Phase 3 handoff: real rail adapter replaces the dummy bank behind the same WS message protocol — protocol frozen here, transport reused there.
+
 ### Carried forward (locked in Phase 1, not re-asked)
 - axum + Tokio, wal-db substrate, i64 minor units + Currency enum, UUIDv7 uniqueness core, `Idempotency-Key` header, JSON status envelope, sync-before-ack per partition.
 
@@ -49,6 +55,7 @@ Refactor single-writer journal into a partitioned multi-writer pipeline; prove k
 - `src/journal.rs` — Journal becomes per-partition instance; accept()/replay() logic reused per partition.
 - `src/api.rs` — handler flow unchanged; router computes partition key + structured ID before dispatch.
 - `src/bin/bench.rs` — rerun at 500/50 to prove the queueing collapse is gone.
+- `src/bin/test-bank.rs` (new, this phase) — dual-side bank rehearsal over both WS planes.
 
 ### Established Patterns
 - Single-writer-per-journal (kept — now N of them); mpsc + oneshot dispatch (kept per partition); metrics hooks per stage (add partition label).
