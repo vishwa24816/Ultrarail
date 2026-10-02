@@ -6,13 +6,14 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{broadcast, mpsc, oneshot};
 
 use crate::dlq::{now_ms, Dlq, DlqEntry};
 use crate::domain::Money;
 use crate::journal::{Journal, JournalError, Staged};
 use crate::metrics;
 use crate::partition;
+use crate::ws::{publish, BankEvent, PendingMap};
 
 pub struct WriteCmd {
     pub scope: String,
@@ -32,6 +33,8 @@ pub type CmdResult = Result<(String, u64, bool), String>;
 pub struct AppState {
     pub writers: Vec<mpsc::Sender<WriteCmd>>,
     pub dlq: Arc<Mutex<Dlq>>,
+    pub bcast: broadcast::Sender<BankEvent>,
+    pub pending: PendingMap,
 }
 
 impl AppState {
@@ -52,6 +55,8 @@ fn spawn_one(
     journal_path: PathBuf,
     id: usize,
     dlq: Arc<Mutex<Dlq>>,
+    bcast: broadcast::Sender<BankEvent>,
+    pending: PendingMap,
 ) -> Result<mpsc::Sender<WriteCmd>, JournalError> {
     let (tx, mut rx) = mpsc::channel::<WriteCmd>(1024);
     let mut journal = Journal::open(&journal_path)?;
@@ -129,6 +134,25 @@ fn spawn_one(
                 by_cmd[k] = Some(match res {
                     Ok((tx, o)) => {
                         metrics::count_accepted();
+                        // Publish to bank streams (fire-and-forget; lagging banks get dropped).
+                        publish(
+                            &bcast,
+                            &pending,
+                            &BankEvent {
+                                tx_id: tx.tx_id.clone(),
+                                status: "ACCEPTED_DURABLE",
+                                amount: tx.money.amount,
+                                price: tx.money.price,
+                                quantity: tx.money.quantity,
+                                currency: format!("{:?}", tx.money.currency),
+                                debit_account: tx.entries.first().map(|e| e.account.clone()).unwrap_or_default(),
+                                credit_account: tx.entries.get(1).map(|e| e.account.clone()).unwrap_or_default(),
+                                lsn: o.lsn,
+                                partition: id,
+                            },
+                            &cmds[k].debit_account,
+                            &cmds[k].credit_account,
+                        );
                         Ok((tx.tx_id, o.lsn, o.replayed))
                     }
                     Err(e) => {
@@ -145,17 +169,23 @@ fn spawn_one(
     Ok(tx)
 }
 
+pub struct Writers {
+    pub senders: Vec<mpsc::Sender<WriteCmd>>,
+    pub dlq: Arc<Mutex<Dlq>>,
+    pub bcast: broadcast::Sender<BankEvent>,
+    pub pending: PendingMap,
+}
+
 /// Open N partitions under `dir` as `journal-{i}.wal` plus a shared `dlq.wal`.
 /// Fail-closed: any bad partition aborts boot.
-pub fn spawn_writers(
-    dir: PathBuf,
-    n: usize,
-) -> Result<(Vec<mpsc::Sender<WriteCmd>>, Arc<Mutex<Dlq>>), JournalError> {
+pub fn spawn_writers(dir: PathBuf, n: usize) -> Result<Writers, JournalError> {
     let dlq = Arc::new(Mutex::new(Dlq::open(&dir.join("dlq.wal")).map_err(|e| JournalError::Codec(e.to_string()))?));
-    let mut out = Vec::with_capacity(n);
+    let (bcast, _) = broadcast::channel(1024);
+    let pending = crate::ws::pending_map();
+    let mut senders = Vec::with_capacity(n);
     for i in 0..n {
-        out.push(spawn_one(dir.join(format!("journal-{i}.wal")), i, dlq.clone())?);
+        senders.push(spawn_one(dir.join(format!("journal-{i}.wal")), i, dlq.clone(), bcast.clone(), pending.clone())?);
     }
     let _ = partition::bucket; // router lives in api; keep import graph honest
-    Ok((out, dlq))
+    Ok(Writers { senders, dlq, bcast, pending })
 }

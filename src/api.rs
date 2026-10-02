@@ -32,8 +32,9 @@ pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/health", get(|| async { "ok" }))
         .route("/payments", axum::routing::post(create_payment))
-        // Operator DLQ view. Localhost only; Phase 5 auth covers it.
         .route("/dlq", get(read_dlq))
+        .route("/ws/client", get(crate::ws::ws_client))
+        .route("/ws/bank", get(crate::ws::ws_bank))
         .layer(RequestBodyLimitLayer::new(64 * 1024))
         .layer(tower_http::trace::TraceLayer::new_for_http())
         .with_state(state)

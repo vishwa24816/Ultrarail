@@ -5,6 +5,7 @@ mod domain;
 mod journal;
 mod metrics;
 mod partition;
+mod ws;
 
 use std::net::SocketAddr;
 
@@ -17,9 +18,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let n = app_state::partition_count();
     // Changing PARTITIONS re-routes idempotency keys: drain before changing (see 02-01 plan).
     tracing::info!("partitions: {n} (PARTITIONS env)");
-    let (writers, dlq) = app_state::spawn_writers(std::path::PathBuf::from(dir), n)
+    let w = app_state::spawn_writers(std::path::PathBuf::from(dir), n)
         .expect("journal open/replay");
-    let app = api::router(app_state::AppState { writers, dlq });
+    let state = app_state::AppState {
+        writers: w.senders,
+        dlq: w.dlq,
+        bcast: w.bcast,
+        pending: w.pending.clone(),
+    };
+    crate::ws::spawn_ack_sweeper(state.clone());
+    let app = api::router(state);
     let addr: SocketAddr = std::env::var("LISTEN_ADDR").unwrap_or_else(|_| "127.0.0.1:3000".into()).parse().expect("LISTEN_ADDR");
     tracing::info!("listening on {addr}");
     let listener = tokio::net::TcpListener::bind(addr).await.expect("bind");

@@ -52,6 +52,13 @@ impl Dlq {
         }
     }
 
+    /// Force durability now. Call after a sweep batch — one fsync per batch.
+    pub fn flush(&mut self) {
+        if self.wal.sync().is_ok() {
+            self.last_sync = Instant::now();
+        }
+    }
+
     pub fn tail(&self, limit: usize) -> Result<Vec<DlqEntry>, DlqError> {
         let mut all = Vec::new();
         for entry in self.wal.iter()? {
