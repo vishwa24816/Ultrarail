@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::{broadcast, mpsc, oneshot};
 
 use crate::accounts::{Registry, Terminal};
+use crate::audit::Audit;
 use crate::dlq::{now_ms, Dlq, DlqEntry};
 use crate::domain::{Money, PaymentTx};
 use crate::events::EventLog;
@@ -66,6 +67,7 @@ pub struct AppState {
     /// Per-partition replay-complete flags for /ready.
     pub ready: Arc<Mutex<Vec<bool>>>,
     pub shutdown_tx: tokio::sync::watch::Sender<bool>,
+    pub audit: Arc<Mutex<Audit>>,
 }
 
 #[derive(Clone)]
@@ -94,13 +96,16 @@ struct PartShared {
     failed_bcast: broadcast::Sender<(String, Terminal)>,
     slot: WriterSlot,
     events: Arc<Mutex<EventLog>>,
+    audit: Arc<Mutex<Audit>>,
     draining: Arc<AtomicBool>,
     ready: Arc<Mutex<Vec<bool>>>,
     shutdown_rx: tokio::sync::watch::Receiver<bool>,
 }
 
 /// Run one partition generation: open, replay, serve until shutdown or crash.
-async fn run_partition(sh: PartShared) -> Result<(), String> {
+/// `rx` is owned by the supervisor and survives restarts, so requests that
+/// arrive mid-reopen queue instead of failing.
+async fn run_partition(sh: PartShared, rx: &mut mpsc::Receiver<WriteCmd>) -> Result<(), String> {
     let id = sh.id;
     // Fault injection for supervision tests (sandbox only).
     if std::env::var("PAYMENT_PANIC_PARTITION").ok().as_deref() == Some(&id.to_string()) {
@@ -108,11 +113,6 @@ async fn run_partition(sh: PartShared) -> Result<(), String> {
     }
     let mut journal =
         Journal::open(&sh.dir.join(format!("journal-{id}.wal"))).map_err(|e| e.to_string())?;
-    // Fresh writer channel per generation; swap into the stable slot.
-    let (tx, mut rx) = mpsc::channel::<WriteCmd>(1024);
-    if let Ok(mut g) = sh.slot.tx.lock() {
-        *g = tx;
-    }
     // Re-queue durable-but-unsettled txs (crash recovery) + rebuild attempt budgets.
     let boot_txs: Vec<PaymentTx> = {
         let mut v = Vec::new();
@@ -160,13 +160,14 @@ async fn run_partition(sh: PartShared) -> Result<(), String> {
         partition: id,
         boot_attempts,
         shutdown: sh.shutdown_rx.clone(),
+        audit: sh.audit.clone(),
     };
     let dev_handle = tokio::spawn(async move { dev.run().await });
     for t in boot_txs {
         let _ = dtx.send(t).await;
     }
     let mut shutdown = sh.shutdown_rx.clone();
-    let res = writer_loop(&mut journal, &mut rx, &mut shutdown, &sh, &dtx).await;
+    let res = writer_loop(&mut journal, rx, &mut shutdown, &sh, &dtx).await;
     // Writer ended: close delivery inbox, wait for drain.
     drop(dtx);
     let _ = tokio::time::timeout(Duration::from_secs(30), dev_handle).await;
@@ -213,6 +214,7 @@ async fn process_batch(
 ) {
     let t0 = Instant::now();
     journal.sweep_if_due();
+    metrics::queue_depth(id, cmds.len() as f64);
     let mut idx: Vec<usize> = Vec::new();
     let mut staged: Vec<Staged> = Vec::new();
     let mut early: Vec<(usize, String)> = Vec::new();
@@ -266,9 +268,20 @@ async fn process_batch(
         by_cmd[e_i] = Some(Err(msg));
     }
     for (k, res) in idx.into_iter().zip(results.into_iter()) {
-        by_cmd[k] = Some(match res {
-            Ok((tx, o)) => {
-                metrics::count_accepted();
+                by_cmd[k] = Some(match res {
+                    Ok((tx, o)) => {
+                        metrics::count_accepted();
+                        if let Ok(mut a) = sh.audit.lock() {
+                            a.record(&crate::audit::entry(
+                                &tx.tx_id,
+                                id,
+                                o.lsn,
+                                if o.replayed { "ACCEPTED" } else { "VALIDATED" },
+                                "ACCEPTED",
+                                "client",
+                                if o.replayed { "idempotent replay" } else { "durable accept" },
+                            ));
+                        }
                 if !o.replayed {
                     if let Ok(mut s) = sh.store.lock() {
                         s.insert(tx.tx_id.clone(), StoredTx { tx: tx.clone(), lsn: o.lsn, partition: id });
@@ -308,8 +321,12 @@ async fn process_batch(
 
 /// Supervisor: restart crashed partitions from WAL with backoff; give up after
 /// 5 rapid crashes (DLQ `partition-down`, other partitions keep serving).
-fn supervise(sh: PartShared) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
+fn supervise(mut sh: PartShared) -> (WriterSlot, tokio::task::JoinHandle<()>) {
+    // Channel owned by the supervisor: requests queue across restarts.
+    let (tx, mut rx) = mpsc::channel::<WriteCmd>(1024);
+    sh.slot = WriterSlot { tx: Arc::new(Mutex::new(tx)) };
+    let slot = sh.slot.clone();
+    let handle = tokio::spawn(async move {
         let max_crashes: usize = std::env::var("SUPERVISOR_MAX_CRASHES")
             .ok()
             .and_then(|s| s.parse().ok())
@@ -323,7 +340,7 @@ fn supervise(sh: PartShared) -> tokio::task::JoinHandle<()> {
         loop {
             // Catch panics (incl. injected) so the supervisor survives to count + restart.
             let outcome = futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(
-                run_partition(sh.clone()),
+                run_partition(sh.clone(), &mut rx),
             ))
             .await;
             match outcome {
@@ -344,7 +361,8 @@ fn supervise(sh: PartShared) -> tokio::task::JoinHandle<()> {
                 }
             }
         }
-    })
+    });
+    (slot, handle)
 }
 
 /// Returns true when the partition is down for good (logged to DLQ).
@@ -392,6 +410,7 @@ pub struct Writers {
     pub ready: Arc<Mutex<Vec<bool>>>,
     pub shutdown_tx: tokio::sync::watch::Sender<bool>,
     pub supervisors: Vec<tokio::task::JoinHandle<()>>,
+    pub audit: Arc<Mutex<Audit>>,
 }
 
 /// Open N partitions under `dir`. Fail-closed: any bad partition aborts boot.
@@ -410,12 +429,13 @@ pub fn spawn_writers(
     let store = Arc::new(Mutex::new(HashMap::new()));
     let registry = Registry::default();
     let ready = Arc::new(Mutex::new(vec![false; n]));
+    let audit = Arc::new(Mutex::new(
+        Audit::open(&dir.join("audit.wal")).map_err(|e| JournalError::Codec(e.to_string()))?,
+    ));
     let mut slots = Vec::with_capacity(n);
     let mut events = Vec::with_capacity(n);
     let mut supervisors = Vec::with_capacity(n);
     for i in 0..n {
-        let (wtx, _) = mpsc::channel::<WriteCmd>(1); // placeholder, swapped on first open
-        let slot = WriterSlot { tx: Arc::new(Mutex::new(wtx)) };
         let ev = Arc::new(Mutex::new(
             EventLog::open(&dir.join(format!("events-{i}.wal")))
                 .map_err(|e| JournalError::Codec(e.to_string()))?,
@@ -429,18 +449,20 @@ pub fn spawn_writers(
             store: store.clone(),
             registry: registry.clone(),
             failed_bcast: failed_bcast.clone(),
-            slot: slot.clone(),
+            slot: WriterSlot { tx: Arc::new(Mutex::new(mpsc::channel::<WriteCmd>(1).0)) },
             events: ev.clone(),
+            audit: audit.clone(),
             draining: draining.clone(),
             ready: ready.clone(),
             shutdown_rx: shutdown_rx.clone(),
         };
-        supervisors.push(supervise(sh));
+        let (slot, handle) = supervise(sh);
+        supervisors.push(handle);
         slots.push(slot);
         events.push(ev);
     }
     // No boot barrier here: partitions mark ready as they finish replay and
     // /ready gates traffic. A dead partition must never hold the listener hostage.
     let _ = partition::bucket; // router lives in api; keep import graph honest
-    Ok(Writers { slots, dlq, bcast, pending, store, events, registry, failed_bcast, draining, ready, shutdown_tx, supervisors })
+    Ok(Writers { slots, dlq, bcast, pending, store, events, registry, failed_bcast, draining, ready, shutdown_tx, supervisors, audit })
 }

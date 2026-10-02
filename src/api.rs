@@ -34,6 +34,7 @@ pub fn router(state: AppState) -> Router {
         .route("/ready", get(read_ready))
         .route("/payments", axum::routing::post(create_payment))
         .route("/dlq", get(read_dlq))
+        .route("/audit", get(read_audit))
         .route("/payments/:id", get(read_payment))
         .route("/ws/client", get(crate::ws::ws_client))
         .route("/ws/bank", get(crate::ws::ws_bank));
@@ -86,6 +87,21 @@ async fn read_payment(
         }
     }
 }
+async fn read_audit(
+    State(state): State<AppState>,
+    axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> impl IntoResponse {
+    // Operator view. Localhost only; Phase 5 auth covers it (03-04).
+    match (q.get("tx_id"), state.audit.lock()) {
+        (Some(id), Ok(a)) => {
+            // ponytail: full scan per query; index when it matters.
+            let entries = a.for_tx(id, q.get("limit").and_then(|s| s.parse().ok()).unwrap_or(50));
+            (StatusCode::OK, Json(serde_json::json!(entries))).into_response()
+        }
+        _ => (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "tx_id required"}))).into_response(),
+    }
+}
+
 async fn read_dlq(
     State(state): State<AppState>,
     axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>,

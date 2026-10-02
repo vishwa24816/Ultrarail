@@ -118,6 +118,7 @@ pub struct Delivery {
     /// Attempt counts rebuilt from the event log on restart (budget survives crashes).
     pub boot_attempts: HashMap<String, u32>,
     pub shutdown: tokio::sync::watch::Receiver<bool>,
+    pub audit: Arc<Mutex<crate::audit::Audit>>,
 }
 
 fn backoff(attempt: u32) -> Duration {
@@ -160,7 +161,7 @@ impl Delivery {
                     metrics::delivery_failed(term.code());
                     if let Some(w) = pending.get_mut(&id) {
                         w.state = DState::Failed(term.code().into());
-                        self.log(&id, EventKind::Failed, term.message());
+                        self.log(&id, EventKind::Failed, term.message(), "bank");
                     }
                     self.sync_events();
                 }
@@ -207,10 +208,10 @@ impl Delivery {
                     w.tx.money.amount,
                 )
             };
-            if let Some(t) = term {
+                if let Some(t) = term {
                 if let Some(w) = pending.get_mut(&id) {
                     w.state = DState::Failed(t.code().into());
-                    self.log(&id, EventKind::Failed, t.message());
+                    self.log(&id, EventKind::Failed, t.message(), "system");
                 }
                 queue.retain(|x| x != &id);
                 continue;
@@ -232,7 +233,7 @@ impl Delivery {
                         w.state = DState::Settled;
                         w.inflight = false;
                     }
-                    self.log(&id, EventKind::Settled, format!("attempt {attempt_no} acked"));
+                    self.log(&id, EventKind::Settled, format!("attempt {attempt_no} acked"), "rail");
                     queue.retain(|x| x != &id);
                 }
                 Ok(SubmitOutcome::Transient(d)) => {
@@ -244,12 +245,12 @@ impl Delivery {
                         if n >= 10 {
                             w.state = DState::Failed("RETRY_EXHAUSTED".into());
                             metrics::delivery_failed("RETRY_EXHAUSTED");
-                            self.log(&id, EventKind::Failed, "retry budget exhausted");
+                            self.log(&id, EventKind::Failed, "retry budget exhausted", "system");
                             queue.retain(|x| x != &id);
                             continue;
                         }
                     }
-                    self.log(&id, EventKind::Attempt, format!("attempt {attempt_no} transient: {d}"));
+                    self.log(&id, EventKind::Attempt, format!("attempt {attempt_no} transient: {d}"), "rail");
                 }
                 Ok(SubmitOutcome::Timeout) | Err(_) => {
                     metrics::delivery_unknown();
@@ -258,7 +259,7 @@ impl Delivery {
                         w.inflight = false;
                         w.state = DState::Unknown { since_ms: now_ms() };
                     }
-                    self.log(&id, EventKind::Unknown, format!("attempt {attempt_no} timeout"));
+                    self.log(&id, EventKind::Unknown, format!("attempt {attempt_no} timeout"), "system");
                 }
                 Ok(SubmitOutcome::Terminal(t, d)) => {
                     metrics::delivery_failed(t.code());
@@ -266,7 +267,7 @@ impl Delivery {
                         w.state = DState::Failed(t.code().into());
                         w.inflight = false;
                     }
-                    self.log(&id, EventKind::Failed, format!("{}: {d}", t.message()));
+                    self.log(&id, EventKind::Failed, format!("{}: {d}", t.message()), "rail");
                     queue.retain(|x| x != &id);
                 }
             }
@@ -295,20 +296,20 @@ impl Delivery {
                     if let Some(w) = pending.get_mut(&id) {
                         w.state = DState::Settled;
                     }
-                    self.log(&id, EventKind::Reconciled, "rail confirmed settled");
+                    self.log(&id, EventKind::Reconciled, "rail confirmed settled", "rail");
                 }
                 QueryOutcome::Failed(t) => {
                     if let Some(w) = pending.get_mut(&id) {
                         w.state = DState::Failed(t.code().into());
                     }
-                    self.log(&id, EventKind::Failed, t.message());
+                    self.log(&id, EventKind::Failed, t.message(), "rail");
                 }
                 QueryOutcome::StillUnknown => {
                     if now_ms().saturating_sub(since) > self.reconcile_timeout_ms {
                         if let Some(w) = pending.get_mut(&id) {
                             w.state = DState::Failed("UNKNOWN_UNRESOLVED".into());
                         }
-                        self.log(&id, EventKind::Failed, "unknown past reconcile timeout");
+                        self.log(&id, EventKind::Failed, "unknown past reconcile timeout", "system");
                         if let Ok(mut d) = self.dlq.lock() {
                             d.push(DlqEntry {
                                 reason: "unknown-unresolved".into(),
@@ -326,9 +327,21 @@ impl Delivery {
         }
     }
 
-    fn log(&self, id: &str, kind: EventKind, detail: impl Into<String>) {
+    fn log(&self, id: &str, kind: EventKind, detail: impl Into<String>, actor: &str) {
+        let detail = detail.into();
         if let Ok(mut e) = self.events.lock() {
-            let _ = e.append(&event(id, kind, detail));
+            let _ = e.append(&event(id, kind.clone(), detail.clone()));
+        }
+        let (from, to) = match kind {
+            EventKind::Submitted => ("RECEIVED", "QUEUED"),
+            EventKind::Attempt => ("QUEUED", "INFLIGHT"),
+            EventKind::Unknown => ("INFLIGHT", "UNKNOWN"),
+            EventKind::Reconciled => ("UNKNOWN", "SETTLED"),
+            EventKind::Settled => ("QUEUED", "SETTLED"),
+            EventKind::Failed => ("QUEUED", "FAILED"),
+        };
+        if let Ok(mut a) = self.audit.lock() {
+            a.record(&crate::audit::entry(id, self.partition, 0, from, to, actor, &detail));
         }
     }
 

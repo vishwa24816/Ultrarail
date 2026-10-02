@@ -1,6 +1,7 @@
 mod accounts;
 mod api;
 mod app_state;
+mod audit;
 mod config;
 mod delivery;
 mod dlq;
@@ -17,6 +18,8 @@ use std::sync::{
     Arc,
 };
 use std::time::Duration;
+
+extern crate metrics as metrics_core;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -49,9 +52,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         draining: draining.clone(),
         ready: w.ready,
         shutdown_tx: shutdown_tx.clone(),
+        audit: w.audit,
     };
     crate::ws::spawn_ack_sweeper(state.clone());
-    let app = api::router(state);
+    // Prometheus exporter on its own port (localhost by default).
+    let prom_addr: SocketAddr = cfg.prom_addr.parse().expect("PROM_ADDR");
+    tokio::spawn(async move {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        if metrics_core::set_global_recorder(recorder).is_err() {
+            return;
+        }
+        let app = axum::Router::new().route(
+            "/metrics",
+            axum::routing::get(move || {
+                let h = handle.clone();
+                async move { h.render() }
+            }),
+        );
+        let listener = match tokio::net::TcpListener::bind(prom_addr).await {
+            Ok(l) => l,
+            Err(_) => return,
+        };
+        let _ = axum::serve(listener, app).await;
+    });
+    let app = api::router(state.clone());
     let addr: SocketAddr = cfg.listen_addr.parse().expect("LISTEN_ADDR");
     tracing::info!("listening on {addr}");
     let listener = tokio::net::TcpListener::bind(addr).await.expect("bind");
@@ -78,6 +103,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     })
     .await
     .is_ok();
+    // Final barriers for best-effort stores (audit + DLQ coalesce syncs).
+    if let Ok(mut a) = state.audit.lock() {
+        a.sync();
+    }
+    if let Ok(mut d) = state.dlq.lock() {
+        d.sync_all();
+    }
     if ok {
         tracing::info!("clean shutdown: all partitions drained and synced");
         Ok(())

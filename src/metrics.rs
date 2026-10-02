@@ -35,3 +35,11 @@ pub fn delivery_failed(reason: &str) {
 pub fn delivery_unknown() {
     metrics::counter!("delivery_unknown_total").increment(1);
 }
+
+pub fn audit_dropped() {
+    metrics::counter!("audit_dropped_total").increment(1);
+}
+
+pub fn queue_depth(partition: usize, n: f64) {
+    metrics::gauge!("writer_queue_depth", "partition" => partition.to_string()).set(n);
+}

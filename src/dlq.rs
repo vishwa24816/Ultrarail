@@ -59,6 +59,11 @@ impl Dlq {
         }
     }
 
+    /// Unconditional final barrier (shutdown path).
+    pub fn sync_all(&mut self) {
+        let _ = self.wal.sync();
+    }
+
     pub fn tail(&self, limit: usize) -> Result<Vec<DlqEntry>, DlqError> {
         let mut all = Vec::new();
         for entry in self.wal.iter()? {
