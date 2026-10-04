@@ -6,15 +6,11 @@ acceptance, delivers them to a rail with exactly-once discipline, matches rail
 confirmations, and survives crashes, restarts, and bank-side failures without
 silent loss or duplicate posting.
 
-This implements the design in [`p.md`](p.md): the state machine
+The state machine
 (`RECEIVED → VALIDATED → ACCEPTED_DURABLE → SUBMITTED → ACKNOWLEDGED → SETTLED`,
 plus `REJECTED`, `UNKNOWN`, `RECONCILIATION_REQUIRED`), the journal-first
 processing path, idempotent retries, double-entry ledger discipline, and the
 staged rollout from simulated rail to production-shaped pilot.
-
-> `p.md` sets one rule above all: **a timeout after submission is `UNKNOWN`
-> until checked — blindly resending could charge or pay twice.** Every retry,
-> reconcile, and settle path in this codebase obeys it.
 
 ## Accomplishments
 
