@@ -1,1 +1,0 @@
-{"commit_docs":true,"granularity":"coarse","model_profile":"balanced","mode":"yolo","parallelization":true,"ship":{"pr_body_sections":[]},"workflow":{"auto_advance":true,"nyquist_validation":false,"plan_check":true,"research":false,"verifier":true}}
