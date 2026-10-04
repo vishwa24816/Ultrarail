@@ -26,6 +26,11 @@ async fn main() {
         return;
     }
 
+    if args.iter().any(|a| a == "--matching") {
+        matching_rehearsal(&base, n, &mut bank_user_w, &mut cli_w, &mut cli_r).await;
+        return;
+    }
+
     let mut submitted: Vec<(String, i64)> = Vec::with_capacity(n);
     let mut receipts = 0;
     for i in 0..n {
@@ -200,6 +205,82 @@ impl rustls::client::danger::ServerCertVerifier for NoVerify {
 
 type CliW = futures::stream::SplitSink<WsStream, tokio_tungstenite::tungstenite::Message>;
 type CliR = futures::stream::SplitStream<WsStream>;
+
+/// Matching rehearsal: submit N, confirm each twice with full rail fields,
+/// assert exactly one settlement each + one deliberate mismatch visible.
+async fn matching_rehearsal(base: &str, n: usize, bank_w: &mut CliW, cli_w: &mut CliW, cli_r: &mut CliR) {
+    use tokio_tungstenite::tungstenite::Message;
+    let client = reqwest::Client::new();
+    let day = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64 / 86_400_000)
+        .unwrap_or(0)
+        .to_string();
+    let mut ids = Vec::with_capacity(n);
+    for i in 0..n {
+        let req = serde_json::json!({
+            "action": "submit",
+            "idempotency_scope": "match-rehearsal",
+            "idempotency_key": format!("mr-{i}"),
+            "debit_account": format!("user:{}", i % 10),
+            "credit_account": format!("merchant:{}", i % 3),
+            "amount": 100,
+            "currency": "USD",
+        });
+        cli_w.send(Message::Text(req.to_string().into())).await.unwrap();
+        let msg = cli_r.next().await.unwrap().unwrap();
+        let v: serde_json::Value = serde_json::from_str(msg.to_text().unwrap()).unwrap();
+        assert_eq!(v["status"], "ACCEPTED_DURABLE", "{v}");
+        ids.push(v["tx_id"].as_str().unwrap().to_string());
+    }
+    // Confirm each twice (duplicates must stop at the guard).
+    for (i, id) in ids.iter().enumerate() {
+        for r in 0..2 {
+            let c = serde_json::json!({
+                "type": "tx.confirmed", "tx_id": id,
+                "rail_ref": format!("rail-mr-{i}-{r}"), "amount": 100,
+                "currency": "USD",
+                "counterparty": format!("merchant:{}", i % 3),
+                "value_date": day,
+            });
+            bank_w.send(Message::Text(c.to_string().into())).await.unwrap();
+        }
+    }
+    // One deliberate mismatch.
+    let bad = serde_json::json!({
+        "type": "tx.confirmed", "tx_id": ids[0],
+        "rail_ref": "rail-bad", "amount": 1,
+        "currency": "USD", "counterparty": "merchant:0",
+        "value_date": day,
+    });
+    bank_w.send(Message::Text(bad.to_string().into())).await.unwrap();
+    // Settle + match.
+    let mut settled = 0;
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+    while settled < n && tokio::time::Instant::now() < deadline {
+        settled = 0;
+        for id in &ids {
+            let s: serde_json::Value =
+                client.get(format!("{base}/payments/{id}")).send().await.unwrap().json().await.unwrap();
+            if s["matched"] == true {
+                settled += 1;
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+    assert_eq!(settled, n, "all must match");
+    // Exactly one writer settlement each (duplicates audited, mismatch visible).
+    for id in &ids {
+        let s: serde_json::Value =
+            client.get(format!("{base}/payments/{id}")).send().await.unwrap().json().await.unwrap();
+        let count = s["events"]
+            .as_array()
+            .map(|a| a.iter().filter(|e| e["kind"] == "settled" && e["detail"] == "matcher confident").count())
+            .unwrap_or(0);
+        assert_eq!(count, 1, "double settlement for {id}");
+    }
+    println!("PASS: {n}/{n} matched exactly once (late mismatch stopped at guard)");
+}
 
 /// Terminal-failure rehearsal: frozen account + low balance fail WITHOUT retry.
 async fn terminal_scenarios(base: &str, bank_w: &mut CliW, cli_w: &mut CliW, cli_r: &mut CliR) {

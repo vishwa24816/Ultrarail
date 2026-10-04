@@ -119,11 +119,15 @@ async fn run_partition(
     }
     let mut journal =
         Journal::open(&sh.dir.join(format!("journal-{id}.wal"))).map_err(|e| e.to_string())?;
-    // Re-queue durable-but-unsettled txs (crash recovery) + rebuild attempt budgets.
+    // Re-queue durable-but-unsettled txs into delivery on boot (crash recovery),
+    // and rebuild the status store so GET works across restarts.
     let boot_txs: Vec<PaymentTx> = {
         let mut v = Vec::new();
-        for (tx_id, _) in journal.tx_list() {
+        for (tx_id, lsn) in journal.tx_list() {
             if let Ok(t) = journal.read_tx_public(&tx_id) {
+                if let Ok(mut s) = sh.store.lock() {
+                    s.insert(tx_id.clone(), StoredTx { tx: t.clone(), lsn, partition: id });
+                }
                 v.push(t);
             }
         }
