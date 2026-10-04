@@ -63,6 +63,7 @@ impl Config {
             "PAYMENT_PANIC_PARTITION",
             "SUPERVISOR_MAX_CRASHES",
             "SUPERVISOR_BACKOFF_MS",
+            "PAYMENT_KEY_RELOAD_SECS",
         ];
         let unknown: Vec<String> = std::env::vars()
             .filter(|(k, _)| k.starts_with("PAYMENT_") && !known.contains(&k.as_str()))
