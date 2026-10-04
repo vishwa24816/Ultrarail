@@ -17,7 +17,7 @@ use crate::metrics;
 // ---- Rail adapter ----
 
 pub enum SubmitOutcome {
-    Acked,
+    Acked(String),
     Transient(String),
     Timeout,
     Terminal(Terminal, String),
@@ -78,7 +78,7 @@ impl Rail for SimRail {
         if self.roll() < self.fail_rate {
             return SubmitOutcome::Transient("sim transient".into());
         }
-        SubmitOutcome::Acked
+        SubmitOutcome::Acked(format!("sim-{}", tx.tx_id))
     }
 
     async fn query(&self, _tx_id: &str) -> QueryOutcome {
@@ -108,6 +108,7 @@ struct Work {
 pub struct Delivery {
     pub inbox: mpsc::Receiver<PaymentTx>,
     pub failed_rx: tokio::sync::broadcast::Receiver<(String, Terminal)>,
+    pub settle_tx: mpsc::Sender<crate::matcher::SettleReq>,
     pub events: Arc<Mutex<EventLog>>,
     pub dlq: Arc<Mutex<Dlq>>,
     pub registry: Registry,
@@ -227,13 +228,20 @@ impl Delivery {
             let attempt_no = pending.get(&id).map(|w| w.attempts).unwrap_or(0);
             let res = tokio::time::timeout(self.rail_timeout, self.rail.submit(&tx)).await;
             match res {
-                Ok(SubmitOutcome::Acked) => {
+                Ok(SubmitOutcome::Acked(rail_ref)) => {
                     metrics::delivery_settled();
-                    if let Some(w) = pending.get_mut(&id) {
-                        w.state = DState::Settled;
-                        w.inflight = false;
-                    }
-                    self.log(&id, EventKind::Settled, format!("attempt {attempt_no} acked"), "rail");
+                    // Settlement itself goes through the matcher's settled-set guard
+                    // in the writer task (single owner, no race). Delivery only routes.
+                    let tx_day = tx.timestamp_ms / 86_400_000;
+                    let confirm = crate::matcher::RailConfirm {
+                        rail_ref: Some(rail_ref),
+                        amount: Some(tx.money.amount),
+                        currency: Some(format!("{:?}", tx.money.currency)),
+                        counterparty: tx.entries.get(1).map(|e| e.account.clone()),
+                        value_date: Some(tx_day.to_string()),
+                    };
+                    let _ = self.settle_tx.send(crate::matcher::SettleReq { tx_id: id.clone(), confirm }).await;
+                    self.log(&id, EventKind::Settled, format!("attempt {attempt_no} acked, routed to matcher"), "rail");
                     queue.retain(|x| x != &id);
                 }
                 Ok(SubmitOutcome::Transient(d)) => {

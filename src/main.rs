@@ -9,6 +9,7 @@ mod dlq;
 mod domain;
 mod events;
 mod journal;
+mod matcher;
 mod metrics;
 mod partition;
 mod ws;
@@ -51,6 +52,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         pending: w.pending.clone(),
         registry: w.registry,
         failed_tx: w.failed_bcast,
+        settle_routes: w.settle_routes,
         store: w.store,
         events: w.events,
         draining: draining.clone(),

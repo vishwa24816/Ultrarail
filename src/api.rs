@@ -83,11 +83,12 @@ async fn read_payment(
                 evs = crate::delivery::Delivery::snapshot(&state.events[st.partition], &id);
             }
             let last = evs.last().map(|e| format!("{:?}", e.kind)).unwrap_or_else(|| "ACCEPTED".into());
+            let matched = evs.iter().any(|e| format!("{:?}", e.kind) == "Settled");
             (
                 StatusCode::OK,
                 Json(serde_json::json!({
                     "tx": st.tx, "lsn": st.lsn, "partition": st.partition,
-                    "delivery_state": last, "events": evs,
+                    "delivery_state": last, "matched": matched, "events": evs,
                 })),
             )
                 .into_response()

@@ -43,3 +43,15 @@ pub fn audit_dropped() {
 pub fn queue_depth(partition: usize, n: f64) {
     metrics::gauge!("writer_queue_depth", "partition" => partition.to_string()).set(n);
 }
+
+pub fn matched_total() {
+    metrics::counter!("matched_total").increment(1);
+}
+
+pub fn duplicate_confirmation() {
+    metrics::counter!("duplicate_confirmations_total").increment(1);
+}
+
+pub fn exception_total(reason: &str) {
+    metrics::counter!("exceptions_total", "reason" => reason.to_string()).increment(1);
+}

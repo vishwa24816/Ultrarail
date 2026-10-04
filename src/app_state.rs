@@ -58,6 +58,7 @@ pub struct AppState {
     pub pending: PendingMap,
     pub registry: Registry,
     pub failed_tx: broadcast::Sender<(String, Terminal)>,
+    pub settle_routes: Vec<mpsc::Sender<crate::matcher::SettleReq>>,
     /// Durable txs by id for GET /payments/:id. Grows with traffic —
     /// ponytail: TTL sweep when it matters, map is bounded by journal anyway.
     pub store: Arc<Mutex<HashMap<String, StoredTx>>>,
@@ -97,6 +98,7 @@ struct PartShared {
     slot: WriterSlot,
     events: Arc<Mutex<EventLog>>,
     audit: Arc<Mutex<Audit>>,
+    settle_tx: mpsc::Sender<crate::matcher::SettleReq>,
     draining: Arc<AtomicBool>,
     ready: Arc<Mutex<Vec<bool>>>,
     shutdown_rx: tokio::sync::watch::Receiver<bool>,
@@ -105,7 +107,11 @@ struct PartShared {
 /// Run one partition generation: open, replay, serve until shutdown or crash.
 /// `rx` is owned by the supervisor and survives restarts, so requests that
 /// arrive mid-reopen queue instead of failing.
-async fn run_partition(sh: PartShared, rx: &mut mpsc::Receiver<WriteCmd>) -> Result<(), String> {
+async fn run_partition(
+    sh: PartShared,
+    rx: &mut mpsc::Receiver<WriteCmd>,
+    srx: &mut mpsc::Receiver<crate::matcher::SettleReq>,
+) -> Result<(), String> {
     let id = sh.id;
     // Fault injection for supervision tests (sandbox only).
     if std::env::var("PAYMENT_PANIC_PARTITION").ok().as_deref() == Some(&id.to_string()) {
@@ -142,9 +148,26 @@ async fn run_partition(sh: PartShared, rx: &mut mpsc::Receiver<WriteCmd>) -> Res
     tracing::info!("partition {id}: replayed {} records", journal.len());
     let (dtx, drx) = mpsc::channel::<PaymentTx>(1024);
     let frx = sh.failed_bcast.subscribe();
+    // Rebuild the settled-set guard from event replay (D-02).
+    let mut settled = {
+        let mut set = crate::matcher::SettledSet::new();
+        if let Ok(e) = sh.events.lock() {
+            let ids: Vec<String> = e
+                .replay()
+                .into_iter()
+                .filter(|ev| matches!(ev.kind, crate::events::EventKind::Settled | crate::events::EventKind::Reconciled))
+                .map(|ev| ev.tx_id)
+                .collect();
+            for tx_id in &ids {
+                set.settle(tx_id);
+            }
+        }
+        set
+    };
     let dev = crate::delivery::Delivery {
         inbox: drx,
         failed_rx: frx,
+        settle_tx: sh.settle_tx.clone(),
         events: sh.events.clone(),
         dlq: sh.dlq.clone(),
         registry: sh.registry.clone(),
@@ -167,7 +190,7 @@ async fn run_partition(sh: PartShared, rx: &mut mpsc::Receiver<WriteCmd>) -> Res
         let _ = dtx.send(t).await;
     }
     let mut shutdown = sh.shutdown_rx.clone();
-    let res = writer_loop(&mut journal, rx, &mut shutdown, &sh, &dtx).await;
+    let res = writer_loop(&mut journal, rx, &mut shutdown, &sh, &dtx, srx, &mut settled).await;
     // Writer ended: close delivery inbox, wait for drain.
     drop(dtx);
     let _ = tokio::time::timeout(Duration::from_secs(30), dev_handle).await;
@@ -181,10 +204,26 @@ async fn writer_loop(
     shutdown: &mut tokio::sync::watch::Receiver<bool>,
     sh: &PartShared,
     dtx: &mpsc::Sender<PaymentTx>,
+    srx: &mut mpsc::Receiver<crate::matcher::SettleReq>,
+    settled: &mut crate::matcher::SettledSet,
 ) -> Result<(), String> {
     let id = sh.id;
     loop {
+        // Settle requests share the loop so check + record happen in one turn (D-03).
+        while let Ok(req) = srx.try_recv() {
+            settle_one(journal, sh, settled, req, id);
+        }
         let first = tokio::select! {
+            req = srx.recv() => match req {
+                Some(req) => {
+                    settle_one(journal, sh, settled, req, id);
+                    continue;
+                }
+                None => {
+                    let _ = journal.sync();
+                    return Ok(());
+                }
+            },
             c = rx.recv() => match c {
                 Some(c) => c,
                 None => {
@@ -319,13 +358,84 @@ async fn process_batch(
     }
 }
 
+/// Settle path: guard-check + match + record in one writer turn. No interleaving.
+fn settle_one(
+    journal: &Journal,
+    sh: &PartShared,
+    settled: &mut crate::matcher::SettledSet,
+    req: crate::matcher::SettleReq,
+    id: usize,
+) {
+    let tx = match journal.read_tx_public(&req.tx_id) {
+        Ok(t) => t,
+        Err(_) => {
+            // Unknown tx id: forgery or cross-partition stray — visible, never settled.
+            if let Ok(mut d) = sh.dlq.lock() {
+                d.push(crate::dlq::DlqEntry {
+                    reason: "unmatched-confirmation".into(),
+                    scope: String::new(),
+                    key: String::new(),
+                    tx_id: Some(req.tx_id.clone()),
+                    detail: "confirmation for unknown tx".into(),
+                    at_ms: crate::dlq::now_ms(),
+                });
+            }
+            crate::metrics::exception_total("unmatched-confirmation");
+            return;
+        }
+    };
+    if !settled.settle(&tx.tx_id) {
+        // Duplicate confirmation: audit only, zero journal writes (D-01).
+        if let Ok(mut a) = sh.audit.lock() {
+            a.record(&crate::audit::entry(&tx.tx_id, id, 0, "SETTLED", "SETTLED", "rail", "duplicate-confirmation"));
+        }
+        crate::metrics::duplicate_confirmation();
+        return;
+    }
+    let credit = tx.entries.get(1).map(|e| e.account.as_str()).unwrap_or("");
+    let cur = format!("{:?}", tx.money.currency);
+    match crate::matcher::match_confirm(tx.money.amount, &cur, credit, tx.timestamp_ms / 86_400_000, &req.confirm) {
+        crate::matcher::MatchResult::Confident => {
+            if let Ok(mut e) = sh.events.lock() {
+                let _ = e.append(&crate::events::event(&tx.tx_id, crate::events::EventKind::Settled, "matcher confident"));
+                let _ = e.sync();
+            }
+            if let Ok(mut a) = sh.audit.lock() {
+                a.record(&crate::audit::entry(&tx.tx_id, id, 0, "ACCEPTED", "SETTLED", "rail", "exact match"));
+            }
+            crate::metrics::matched_total();
+        }
+        crate::matcher::MatchResult::NearMiss(reason) => {
+            // Not settled: release the guard so a later correct confirmation can settle.
+            settled.un_settle(&tx.tx_id);
+            if let Ok(mut d) = sh.dlq.lock() {
+                d.push(crate::dlq::DlqEntry {
+                    reason: "ambiguous-match".into(),
+                    scope: tx.idempotency_scope.clone(),
+                    key: tx.idempotency_key.clone(),
+                    tx_id: Some(tx.tx_id.clone()),
+                    detail: reason.clone(),
+                    at_ms: crate::dlq::now_ms(),
+                });
+            }
+            if let Ok(mut a) = sh.audit.lock() {
+                a.record(&crate::audit::entry(&tx.tx_id, id, 0, "ACCEPTED", "EXCEPTION", "rail", &reason));
+            }
+            crate::metrics::exception_total("ambiguous-match");
+        }
+    }
+}
+
 /// Supervisor: restart crashed partitions from WAL with backoff; give up after
 /// 5 rapid crashes (DLQ `partition-down`, other partitions keep serving).
-fn supervise(mut sh: PartShared) -> (WriterSlot, tokio::task::JoinHandle<()>) {
-    // Channel owned by the supervisor: requests queue across restarts.
+fn supervise(mut sh: PartShared) -> (WriterSlot, mpsc::Sender<crate::matcher::SettleReq>, tokio::task::JoinHandle<()>) {
+    // Channels owned by the supervisor: requests queue across restarts.
     let (tx, mut rx) = mpsc::channel::<WriteCmd>(1024);
+    let (stx, mut srx) = mpsc::channel::<crate::matcher::SettleReq>(1024);
     sh.slot = WriterSlot { tx: Arc::new(Mutex::new(tx)) };
+    sh.settle_tx = stx.clone();
     let slot = sh.slot.clone();
+    let route = stx;
     let handle = tokio::spawn(async move {
         let max_crashes: usize = std::env::var("SUPERVISOR_MAX_CRASHES")
             .ok()
@@ -340,7 +450,7 @@ fn supervise(mut sh: PartShared) -> (WriterSlot, tokio::task::JoinHandle<()>) {
         loop {
             // Catch panics (incl. injected) so the supervisor survives to count + restart.
             let outcome = futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(
-                run_partition(sh.clone(), &mut rx),
+                run_partition(sh.clone(), &mut rx, &mut srx),
             ))
             .await;
             match outcome {
@@ -362,7 +472,7 @@ fn supervise(mut sh: PartShared) -> (WriterSlot, tokio::task::JoinHandle<()>) {
             }
         }
     });
-    (slot, handle)
+    (slot, route, handle)
 }
 
 /// Returns true when the partition is down for good (logged to DLQ).
@@ -406,6 +516,7 @@ pub struct Writers {
     pub events: Vec<Arc<Mutex<EventLog>>>,
     pub registry: Registry,
     pub failed_bcast: broadcast::Sender<(String, Terminal)>,
+    pub settle_routes: Vec<mpsc::Sender<crate::matcher::SettleReq>>,
     pub draining: Arc<AtomicBool>,
     pub ready: Arc<Mutex<Vec<bool>>>,
     pub shutdown_tx: tokio::sync::watch::Sender<bool>,
@@ -425,6 +536,7 @@ pub fn spawn_writers(
     let dlq = Arc::new(Mutex::new(Dlq::open(&dir.join("dlq.wal")).map_err(|e| JournalError::Codec(e.to_string()))?));
     let (bcast, _) = broadcast::channel(1024);
     let (failed_bcast, _) = broadcast::channel(1024);
+    let (settle_dummy, _) = mpsc::channel::<crate::matcher::SettleReq>(1);
     let pending = crate::ws::pending_map();
     let store = Arc::new(Mutex::new(HashMap::new()));
     let registry = Registry::default();
@@ -433,6 +545,7 @@ pub fn spawn_writers(
         Audit::open(&dir.join("audit.wal")).map_err(|e| JournalError::Codec(e.to_string()))?,
     ));
     let mut slots = Vec::with_capacity(n);
+    let mut routes = Vec::with_capacity(n);
     let mut events = Vec::with_capacity(n);
     let mut supervisors = Vec::with_capacity(n);
     for i in 0..n {
@@ -449,6 +562,7 @@ pub fn spawn_writers(
             store: store.clone(),
             registry: registry.clone(),
             failed_bcast: failed_bcast.clone(),
+            settle_tx: settle_dummy.clone(),
             slot: WriterSlot { tx: Arc::new(Mutex::new(mpsc::channel::<WriteCmd>(1).0)) },
             events: ev.clone(),
             audit: audit.clone(),
@@ -456,13 +570,14 @@ pub fn spawn_writers(
             ready: ready.clone(),
             shutdown_rx: shutdown_rx.clone(),
         };
-        let (slot, handle) = supervise(sh);
+        let (slot, route, handle) = supervise(sh);
         supervisors.push(handle);
         slots.push(slot);
+        routes.push(route);
         events.push(ev);
     }
     // No boot barrier here: partitions mark ready as they finish replay and
     // /ready gates traffic. A dead partition must never hold the listener hostage.
     let _ = partition::bucket; // router lives in api; keep import graph honest
-    Ok(Writers { slots, dlq, bcast, pending, store, events, registry, failed_bcast, draining, ready, shutdown_tx, supervisors, audit })
+    Ok(Writers { slots, dlq, bcast, pending, store, events, registry, failed_bcast, settle_routes: routes, draining, ready, shutdown_tx, supervisors, audit })
 }

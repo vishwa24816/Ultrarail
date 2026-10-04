@@ -280,6 +280,57 @@ pub async fn ws_bank(
                                     ) {
                                         state.registry.set_flag(acct, flag, on);
                                     }
+                                } else if v["type"] == "tx.confirmed" {
+                                    // Rail confirmation: route to the OWNING partition only
+                                    // (broadcast would DLQ-duplicate across partitions).
+                                    if let Some(id) = v["tx_id"].as_str() {
+                                        let confirm = crate::matcher::RailConfirm {
+                                            rail_ref: v["rail_ref"].as_str().map(|s| s.to_string()),
+                                            amount: v["amount"].as_i64(),
+                                            currency: v["currency"].as_str().map(|s| s.to_string()),
+                                            counterparty: v["counterparty"].as_str().map(|s| s.to_string()),
+                                            value_date: v["value_date"].as_str().map(|s| s.to_string()),
+                                        };
+                                        let dest = state.store.lock().ok().and_then(|s| {
+                                            s.get(id).map(|st| st.partition)
+                                        });
+                                        match dest {
+                                            Some(p) => {
+                                                if p < state.settle_routes.len() {
+                                                    let req = crate::matcher::SettleReq {
+                                                        tx_id: id.to_string(),
+                                                        confirm,
+                                                    };
+                                                    if state.settle_routes[p].send(req).await.is_err() {
+                                                        // fall through to DLQ below
+                                                        if let Ok(mut d) = state.dlq.lock() {
+                                                            d.push(crate::dlq::DlqEntry {
+                                                                reason: "unmatched-confirmation".into(),
+                                                                scope: String::new(),
+                                                                key: String::new(),
+                                                                tx_id: Some(id.to_string()),
+                                                                detail: "settle queue full".into(),
+                                                                at_ms: crate::dlq::now_ms(),
+                                                            });
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                            None => {
+                                                // Truly unknown: exactly one DLQ entry.
+                                                if let Ok(mut d) = state.dlq.lock() {
+                                                    d.push(crate::dlq::DlqEntry {
+                                                        reason: "unmatched-confirmation".into(),
+                                                        scope: String::new(),
+                                                        key: String::new(),
+                                                        tx_id: Some(id.to_string()),
+                                                        detail: "confirmation for unknown tx".into(),
+                                                        at_ms: crate::dlq::now_ms(),
+                                                    });
+                                                }
+                                            }
+                                        }
+                                    }
                                 } else if v["type"] == "tx.failed" {
                                     if let (Some(id), Some(reason)) =
                                         (v["tx_id"].as_str(), v["reason"].as_str())
